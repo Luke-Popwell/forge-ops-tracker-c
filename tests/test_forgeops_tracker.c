@@ -1,6 +1,6 @@
 /*
- * A minimal, hand-rolled test runner rather than an external framework (Unity/CMocka/Criterion)
- * -- this SDK has exactly one real dependency (libcurl, for HTTP -- see client.h's own comment
+ * A minimal, hand-rolled test runner rather than an external framework (Unity/CMocka/Criterion):
+ * this SDK has exactly one real dependency (libcurl, for HTTP, see client.h's own comment
  * on why that one's unavoidable) and a test framework isn't, the same "only depend on what's
  * genuinely necessary" line every client in this repo draws.
  */
@@ -10,17 +10,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <dirent.h>
+#include <pthread.h>
+
+#include "forgeops_tracker/breadcrumbs.h"
 #include "forgeops_tracker/client.h"
 #include "forgeops_tracker/configuration.h"
 #include "forgeops_tracker/crash_store.h"
 #include "forgeops_tracker/event_builder.h"
 #include "forgeops_tracker/forgeops_tracker.h"
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#include <math.h>
+#include "forgeops_tracker/performance.h"
 #include "forgeops_tracker/pii_scrubber.h"
 #include "forgeops_tracker/reporter.h"
+#include "forgeops_tracker/signal_handler.h"
 
 static int g_tests_run = 0;
 static int g_tests_failed = 0;
@@ -180,7 +191,7 @@ TEST(pii_scrub_ssn) {
 TEST(pii_scrub_known_token_formats) {
   /* Each fake credential below is split across adjacent string literals (which the C compiler
    * concatenates into one string at compile time, same runtime value either way), not one
-   * contiguous literal -- none of these were ever real, but GitHub's push protection flags the
+   * contiguous literal: none of these were ever real, but GitHub's push protection flags the
    * shape regardless of context, and a single literal here would block pushing this file
    * anywhere. */
   const char *cases[] = {
@@ -220,7 +231,7 @@ TEST(event_builder_basic_fields) {
 
   const char *keys[] = {"order_id"};
   const char *values[] = {"42"};
-  char *json = forgeops_build_event_json(config, "MyError", "boom", keys, values, 1);
+  char *json = forgeops_build_event_json(config, "MyError", "boom", keys, values, 1, NULL, NULL, 0, NULL, 0);
 
   ASSERT_NOT_NULL(json);
   ASSERT_TRUE(strstr(json, "\"exception_class\":\"MyError\"") != NULL);
@@ -230,6 +241,8 @@ TEST(event_builder_basic_fields) {
   ASSERT_TRUE(strstr(json, "\"server_name\":\"web-1\"") != NULL);
   ASSERT_TRUE(strstr(json, "\"order_id\":\"42\"") != NULL);
   ASSERT_TRUE(strstr(json, "\"backtrace\":[{") != NULL); /* a real, non-empty backtrace */
+  ASSERT_TRUE(strstr(json, "\"sdk_name\":\"c\"") != NULL);
+  ASSERT_TRUE(strstr(json, "\"user\"") == NULL); /* omitted entirely when none was given */
 
   free(json);
   forgeops_configuration_destroy(config);
@@ -240,7 +253,7 @@ TEST(event_builder_scrubs_message_and_context_by_default) {
 
   const char *keys[] = {"api_key"};
   const char *values[] = {"shh-secret"};
-  char *json = forgeops_build_event_json(config, "MyError", "failed for user@example.com", keys, values, 1);
+  char *json = forgeops_build_event_json(config, "MyError", "failed for user@example.com", keys, values, 1, NULL, NULL, 0, NULL, 0);
 
   ASSERT_TRUE(strstr(json, "failed for [EMAIL FILTERED]") != NULL);
   ASSERT_TRUE(strstr(json, "\"api_key\":\"[FILTERED]\"") != NULL);
@@ -254,7 +267,7 @@ TEST(event_builder_leaves_payload_untouched_when_scrub_pii_disabled) {
   forgeops_configuration_t *config = forgeops_configuration_create();
   config->scrub_pii = 0;
 
-  char *json = forgeops_build_event_json(config, "MyError", "contact user@example.com", NULL, NULL, 0);
+  char *json = forgeops_build_event_json(config, "MyError", "contact user@example.com", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
 
   ASSERT_TRUE(strstr(json, "contact user@example.com") != NULL);
 
@@ -266,11 +279,11 @@ TEST(event_builder_never_attaches_source_context_in_practice) {
   /* Documents/exercises README.md's own claim: this SDK's real capture path never has a real
    * file+line to offer (a compiled binary carries an image name and a symbol, never a source
    * location), so every frame forgeops_build_event_json actually produces is in_app: false with no
-   * line number -- capture_source_context defaults on, but there's nothing for it to attach here. */
+   * line number: capture_source_context defaults on, but there's nothing for it to attach here. */
   forgeops_configuration_t *config = forgeops_configuration_create();
   ASSERT_TRUE(config->capture_source_context == 1);
 
-  char *json = forgeops_build_event_json(config, "MyError", "boom", NULL, NULL, 0);
+  char *json = forgeops_build_event_json(config, "MyError", "boom", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
 
   ASSERT_NOT_NULL(json);
   ASSERT_TRUE(strstr(json, "\"in_app\":true") == NULL);
@@ -282,10 +295,25 @@ TEST(event_builder_never_attaches_source_context_in_practice) {
   forgeops_configuration_destroy(config);
 }
 
+TEST(event_builder_includes_the_user_when_given_one_never_scrubbed_even_though_its_an_email) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+
+  const char *user_keys[] = {"id", "email"};
+  const char *user_values[] = {"42", "ada@example.com"};
+  char *json = forgeops_build_event_json(config, "MyError", "boom", NULL, NULL, 0, user_keys, user_values, 2, NULL, 0);
+
+  ASSERT_NOT_NULL(json);
+  ASSERT_TRUE(strstr(json, "\"user\":{") != NULL);
+  ASSERT_TRUE(strstr(json, "\"email\":\"ada@example.com\"") != NULL);
+
+  free(json);
+  forgeops_configuration_destroy(config);
+}
+
 /* ---- Source context (forgeops_source_context_json directly) ------------------------------------
  *
  * append_backtrace_json (exercised just above) never actually has a real file+line to hand this
- * function -- see README.md's "Backtrace frames" section -- so these tests call
+ * function (see README.md's "Backtrace frames" section) so these tests call
  * forgeops_source_context_json directly, with a real temp file on disk (mkstemp, not a checked-in
  * fixture), the same way the reference gem's own spec suite exercises the equivalent Ruby method
  * directly against a real Tempfile. This is real, correct, independently-tested code; it's simply
@@ -308,7 +336,7 @@ static char *write_temp_source_file(const char *contents) {
 }
 
 static char *numbered_lines(int count) {
-  /* "line N" per line, newline-joined, no trailing newline -- big enough for every count this
+  /* "line N" per line, newline-joined, no trailing newline: big enough for every count this
    * file's own tests actually use. */
   char *buf = malloc(4096);
   buf[0] = '\0';
@@ -514,7 +542,7 @@ static int start_test_server(int status_code, pid_t *child_pid_out) {
   if (pid == 0) {
     int client_fd = accept(listen_fd, NULL, NULL);
     if (client_fd >= 0) {
-      /* Must read the full request -- headers *and* body -- before responding: closing the
+      /* Must read the full request (headers *and* body) before responding: closing the
        * socket the moment the header terminator shows up (this test server's first draft) can
        * race the client still writing its POST body, which curl reports as a failed request
        * regardless of what status code this server meant to send. Content-Length is always
@@ -609,7 +637,7 @@ TEST(reporter_report_does_nothing_when_disabled) {
   free(config->environment);
   config->environment = strdup("development"); /* not enabled */
 
-  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0);
+  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
 
   ASSERT_NULL(forgeops_crash_store_pending_paths(config));
   remove_directory_recursive(config->crash_reports_directory);
@@ -622,12 +650,33 @@ TEST(reporter_report_writes_a_pending_report_when_enabled) {
   free(config->environment);
   config->environment = strdup("production");
 
-  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0);
+  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
 
   char **paths = forgeops_crash_store_pending_paths(config);
   ASSERT_NOT_NULL(paths);
   forgeops_crash_store_free_paths(paths);
 
+  remove_directory_recursive(config->crash_reports_directory);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(reporter_report_includes_the_given_user_never_scrubbed_even_though_its_an_email) {
+  forgeops_configuration_t *config = new_config_with_temp_crash_dir();
+  forgeops_configuration_set_dsn(config, "https://key@host/events");
+  free(config->environment);
+  config->environment = strdup("production");
+
+  const char *user_keys[] = {"id", "email"};
+  const char *user_values[] = {"42", "alice@example.com"};
+  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0, user_keys, user_values, 2, NULL, 0);
+
+  char **paths = forgeops_crash_store_pending_paths(config);
+  ASSERT_NOT_NULL(paths);
+  char *contents = forgeops_crash_store_read(paths[0]);
+  ASSERT_TRUE(strstr(contents, "alice@example.com") != NULL);
+
+  free(contents);
+  forgeops_crash_store_free_paths(paths);
   remove_directory_recursive(config->crash_reports_directory);
   forgeops_configuration_destroy(config);
 }
@@ -643,7 +692,7 @@ TEST(reporter_upload_pending_reports_delivers_and_deletes_on_success) {
   free(config->environment);
   config->environment = strdup("production");
 
-  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0);
+  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
   forgeops_upload_pending_reports(config);
 
   ASSERT_NULL(forgeops_crash_store_pending_paths(config));
@@ -664,7 +713,7 @@ TEST(reporter_upload_pending_reports_leaves_file_on_failure) {
   free(config->environment);
   config->environment = strdup("production");
 
-  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0);
+  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
   forgeops_upload_pending_reports(config);
 
   char **paths = forgeops_crash_store_pending_paths(config);
@@ -694,12 +743,97 @@ TEST(tracker_capture_error_delivers_through_the_full_stack) {
   snprintf(dir, sizeof(dir), "/tmp/forgeops-c-tracker-tests-%d", getpid());
   config->crash_reports_directory = strdup(dir);
 
-  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0);
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
   forgeops_tracker_upload_pending_reports();
 
   ASSERT_NULL(forgeops_crash_store_pending_paths(config));
 
   waitpid(child, NULL, 0);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracker_set_user_attaches_the_user_to_a_later_capture_error_call) {
+  forgeops_tracker_reset_for_testing();
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_set_dsn(config, "https://key@host/events");
+  free(config->environment);
+  config->environment = strdup("production");
+  free(config->crash_reports_directory);
+  char dir[256];
+  snprintf(dir, sizeof(dir), "/tmp/forgeops-c-tracker-set-user-tests-%d", getpid());
+  config->crash_reports_directory = strdup(dir);
+
+  const char *user_keys[] = {"id", "email"};
+  const char *user_values[] = {"42", "alice@example.com"};
+  forgeops_tracker_set_user(user_keys, user_values, 2);
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
+
+  char **paths = forgeops_crash_store_pending_paths(config);
+  ASSERT_NOT_NULL(paths);
+  char *contents = forgeops_crash_store_read(paths[0]);
+  ASSERT_TRUE(strstr(contents, "alice@example.com") != NULL);
+
+  free(contents);
+  forgeops_crash_store_free_paths(paths);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracker_an_explicit_user_argument_overrides_whatever_set_user_last_set) {
+  forgeops_tracker_reset_for_testing();
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_set_dsn(config, "https://key@host/events");
+  free(config->environment);
+  config->environment = strdup("production");
+  free(config->crash_reports_directory);
+  char dir[256];
+  snprintf(dir, sizeof(dir), "/tmp/forgeops-c-tracker-override-user-tests-%d", getpid());
+  config->crash_reports_directory = strdup(dir);
+
+  const char *set_keys[] = {"id"};
+  const char *set_values[] = {"42"};
+  forgeops_tracker_set_user(set_keys, set_values, 1);
+
+  const char *override_keys[] = {"id"};
+  const char *override_values[] = {"99"};
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, override_keys, override_values, 1);
+
+  char **paths = forgeops_crash_store_pending_paths(config);
+  ASSERT_NOT_NULL(paths);
+  char *contents = forgeops_crash_store_read(paths[0]);
+  ASSERT_TRUE(strstr(contents, "\"id\":\"99\"") != NULL);
+
+  free(contents);
+  forgeops_crash_store_free_paths(paths);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracker_reset_for_testing_clears_the_current_user) {
+  const char *user_keys[] = {"id"};
+  const char *user_values[] = {"42"};
+  forgeops_tracker_set_user(user_keys, user_values, 1);
+  forgeops_tracker_reset_for_testing();
+
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_set_dsn(config, "https://key@host/events");
+  free(config->environment);
+  config->environment = strdup("production");
+  free(config->crash_reports_directory);
+  char dir[256];
+  snprintf(dir, sizeof(dir), "/tmp/forgeops-c-tracker-reset-user-tests-%d", getpid());
+  config->crash_reports_directory = strdup(dir);
+
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
+
+  char **paths = forgeops_crash_store_pending_paths(config);
+  ASSERT_NOT_NULL(paths);
+  char *contents = forgeops_crash_store_read(paths[0]);
+  ASSERT_TRUE(strstr(contents, "\"user\"") == NULL);
+
+  free(contents);
+  forgeops_crash_store_free_paths(paths);
   remove_directory_recursive(dir);
   forgeops_tracker_reset_for_testing();
 }
@@ -718,6 +852,1087 @@ TEST(tracker_install_handlers_is_idempotent) {
 
   remove_directory_recursive(dir);
   forgeops_tracker_reset_for_testing();
+}
+
+/* ---- Breadcrumbs -------------------------------------------------------------------------------- */
+
+/* A tracker configured to write (not deliver) into a per-test directory, so a test can read back
+ * exactly what forgeops_tracker_capture_error would have sent. */
+static forgeops_configuration_t *breadcrumb_test_setup(const char *label, char *dir, size_t dir_size) {
+  forgeops_tracker_reset_for_testing();
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_set_dsn(config, "https://key@host/events");
+  free(config->environment);
+  config->environment = strdup("production");
+  free(config->crash_reports_directory);
+  snprintf(dir, dir_size, "/tmp/forgeops-c-breadcrumb-%s-%d", label, getpid());
+  config->crash_reports_directory = strdup(dir);
+  return config;
+}
+
+/* The JSON of the one pending report capture_error wrote. Caller frees. */
+static char *read_only_pending_report(const forgeops_configuration_t *config) {
+  char **paths = forgeops_crash_store_pending_paths(config);
+  if (paths == NULL) return NULL;
+  char *contents = forgeops_crash_store_read(paths[0]);
+  forgeops_crash_store_free_paths(paths);
+  return contents;
+}
+
+TEST(breadcrumbs_add_attaches_the_trail_to_a_later_capture_error_call) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("attach", dir, sizeof(dir));
+
+  const char *data_keys[] = {"order_id"};
+  const char *data_values[] = {"42"};
+  forgeops_tracker_add_breadcrumb("charging card", "payment", "info", data_keys, data_values, 1);
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
+
+  char *contents = read_only_pending_report(config);
+  ASSERT_NOT_NULL(contents);
+  ASSERT_TRUE(strstr(contents, "\"breadcrumbs\":[{\"category\":\"payment\",\"message\":\"charging card\",\"level\":\"info\"") != NULL);
+  ASSERT_TRUE(strstr(contents, "\"data\":{\"order_id\":\"42\"}") != NULL);
+
+  free(contents);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_null_category_and_level_default_to_custom_and_info) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+  forgeops_tracker_add_breadcrumb("something happened", NULL, NULL, NULL, NULL, 0);
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 1);
+  ASSERT_TRUE(strstr(crumbs[0], "\"category\":\"custom\"") != NULL);
+  ASSERT_TRUE(strstr(crumbs[0], "\"level\":\"info\"") != NULL);
+  ASSERT_TRUE(strstr(crumbs[0], "\"data\":{}") != NULL);
+  ASSERT_TRUE(strstr(crumbs[0], "\"timestamp\":\"20") != NULL);
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_keep_only_the_most_recent_max_breadcrumbs_dropping_the_oldest) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+  forgeops_tracker_configuration()->max_breadcrumbs = 2;
+
+  forgeops_tracker_add_breadcrumb("first", NULL, NULL, NULL, NULL, 0);
+  forgeops_tracker_add_breadcrumb("second", NULL, NULL, NULL, NULL, 0);
+  forgeops_tracker_add_breadcrumb("third", NULL, NULL, NULL, NULL, 0);
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 2);
+  ASSERT_TRUE(strstr(crumbs[0], "\"message\":\"second\"") != NULL);
+  ASSERT_TRUE(strstr(crumbs[1], "\"message\":\"third\"") != NULL);
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_wrap_around_the_ring_many_times_and_stay_in_order) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+  forgeops_tracker_configuration()->max_breadcrumbs = 3;
+
+  for (int i = 0; i < 10; i++) {
+    char message[16];
+    snprintf(message, sizeof(message), "crumb %d", i);
+    forgeops_tracker_add_breadcrumb(message, NULL, NULL, NULL, NULL, 0);
+  }
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 3);
+  ASSERT_TRUE(strstr(crumbs[0], "crumb 7") != NULL);
+  ASSERT_TRUE(strstr(crumbs[1], "crumb 8") != NULL);
+  ASSERT_TRUE(strstr(crumbs[2], "crumb 9") != NULL);
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_record_nothing_when_track_breadcrumbs_is_off) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+  forgeops_tracker_configuration()->track_breadcrumbs = 0;
+
+  forgeops_tracker_add_breadcrumb("nope", NULL, NULL, NULL, NULL, 0);
+
+  ASSERT_NULL(forgeops_breadcrumbs_snapshot(&count));
+  ASSERT_TRUE(count == 0);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_clear_empties_the_trail_and_the_report_carries_no_breadcrumbs_key) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("clear", dir, sizeof(dir));
+
+  forgeops_tracker_add_breadcrumb("first", NULL, NULL, NULL, NULL, 0);
+  forgeops_tracker_clear_breadcrumbs();
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
+
+  char *contents = read_only_pending_report(config);
+  ASSERT_NOT_NULL(contents);
+  ASSERT_TRUE(strstr(contents, "\"breadcrumbs\"") == NULL);
+
+  free(contents);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_scrub_message_and_data_when_added_but_not_category_or_level) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+
+  const char *data_keys[] = {"email", "password"};
+  const char *data_values[] = {"alice@example.com", "hunter2"};
+  forgeops_tracker_add_breadcrumb("emailed alice@example.com", "custom", "info", data_keys, data_values, 2);
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 1);
+  ASSERT_TRUE(strstr(crumbs[0], "alice@example.com") == NULL);
+  ASSERT_TRUE(strstr(crumbs[0], "hunter2") == NULL);
+  ASSERT_TRUE(strstr(crumbs[0], "\"message\":\"emailed [EMAIL FILTERED]\"") != NULL);
+  ASSERT_TRUE(strstr(crumbs[0], "\"password\":\"[FILTERED]\"") != NULL);
+  ASSERT_TRUE(strstr(crumbs[0], "\"category\":\"custom\"") != NULL);
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_leave_values_untouched_when_scrub_pii_is_off) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+  forgeops_tracker_configuration()->scrub_pii = 0;
+
+  forgeops_tracker_add_breadcrumb("emailed alice@example.com", NULL, NULL, NULL, NULL, 0);
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 1);
+  ASSERT_TRUE(strstr(crumbs[0], "alice@example.com") != NULL);
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_escape_quotes_and_control_characters_into_valid_json) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+
+  forgeops_tracker_add_breadcrumb("said \"hi\"\nthen left\\", NULL, NULL, NULL, NULL, 0);
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 1);
+  ASSERT_TRUE(strstr(crumbs[0], "\"message\":\"said \\\"hi\\\"\\nthen left\\\\\"") != NULL);
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_an_oversized_entry_is_shrunk_to_fit_its_slot_never_overflowing_it) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+
+  char long_message[2000];
+  memset(long_message, 'x', sizeof(long_message) - 1);
+  long_message[sizeof(long_message) - 1] = '\0';
+  char long_value[2000];
+  memset(long_value, 'y', sizeof(long_value) - 1);
+  long_value[sizeof(long_value) - 1] = '\0';
+  const char *data_keys[] = {"a", "b", "c", "d", "e", "f"};
+  const char *data_values[] = {long_value, long_value, long_value, long_value, long_value, long_value};
+  forgeops_tracker_add_breadcrumb(long_message, NULL, NULL, data_keys, data_values, 6);
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 1);
+  ASSERT_TRUE(strlen(crumbs[0]) < FORGEOPS_BREADCRUMB_SLOT_SIZE);
+  ASSERT_TRUE(crumbs[0][0] == '{' && crumbs[0][strlen(crumbs[0]) - 1] == '}');
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_truncation_never_cuts_a_multibyte_utf8_character_in_half) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+
+  /* 200 three-byte characters = 600 bytes: over the 300-byte message cap, and 300 is a multiple
+   * of 3 so this lands exactly on a boundary; one leading ASCII byte shifts it to mid-character. */
+  char message[1 + 200 * 3 + 1];
+  message[0] = 'a';
+  for (int i = 0; i < 200; i++) memcpy(message + 1 + i * 3, "\xE2\x82\xAC", 3); /* the euro sign */
+  message[sizeof(message) - 1] = '\0';
+  forgeops_tracker_add_breadcrumb(message, NULL, NULL, NULL, NULL, 0);
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 1);
+  /* Every euro sign that made it in is whole: the byte after a lead byte 0xE2 is always 0x82. */
+  for (const unsigned char *p = (const unsigned char *)crumbs[0]; *p != '\0'; p++) {
+    if (*p == 0xE2) {
+      ASSERT_TRUE(p[1] == 0x82 && p[2] == 0xAC);
+    }
+  }
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+static void *add_breadcrumb_on_another_thread(void *arg) {
+  (void)arg;
+  forgeops_tracker_add_breadcrumb("recorded on another thread", NULL, NULL, NULL, NULL, 0);
+  size_t count = 0;
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  int only_its_own = count == 1 && strstr(crumbs[0], "another thread") != NULL;
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  return only_its_own ? (void *)1 : (void *)0;
+}
+
+TEST(breadcrumbs_are_isolated_per_thread) {
+  size_t count = 0;
+  forgeops_tracker_reset_for_testing();
+  forgeops_tracker_add_breadcrumb("recorded on the main thread", NULL, NULL, NULL, NULL, 0);
+
+  pthread_t thread;
+  ASSERT_TRUE(pthread_create(&thread, NULL, add_breadcrumb_on_another_thread, NULL) == 0);
+  void *result = NULL;
+  pthread_join(thread, &result);
+  ASSERT_TRUE(result == (void *)1);
+
+  char **crumbs = forgeops_breadcrumbs_snapshot(&count);
+  ASSERT_TRUE(count == 1);
+  ASSERT_TRUE(strstr(crumbs[0], "main thread") != NULL);
+
+  forgeops_breadcrumbs_free_snapshot(crumbs, count);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_reset_for_testing_clears_the_trail) {
+  size_t count = 0;
+  forgeops_tracker_add_breadcrumb("leftover", NULL, NULL, NULL, NULL, 0);
+  forgeops_tracker_reset_for_testing();
+
+  ASSERT_NULL(forgeops_breadcrumbs_snapshot(&count));
+}
+
+TEST(breadcrumbs_event_builder_includes_the_given_trail_and_omits_the_key_when_empty) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  free(config->environment);
+  config->environment = strdup("production");
+  const char *crumbs[] = {"{\"category\":\"a\",\"message\":\"m1\",\"level\":\"info\",\"timestamp\":\"t\",\"data\":{}}", "{\"category\":\"b\",\"message\":\"m2\",\"level\":\"info\",\"timestamp\":\"t\",\"data\":{}}"};
+
+  char *with = forgeops_build_event_json(config, "MyError", "boom", NULL, NULL, 0, NULL, NULL, 0, crumbs, 2);
+  char *without = forgeops_build_event_json(config, "MyError", "boom", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
+
+  ASSERT_TRUE(strstr(with, "\"breadcrumbs\":[{\"category\":\"a\"") != NULL);
+  ASSERT_TRUE(strstr(with, "},{\"category\":\"b\"") != NULL);
+  ASSERT_TRUE(strstr(without, "\"breadcrumbs\"") == NULL);
+
+  free(with);
+  free(without);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(breadcrumbs_a_fatal_signals_raw_report_carries_the_crashing_threads_trail) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("signal", dir, sizeof(dir));
+
+  /* Runs the handler's real report-writing body in-process (delivering an actual fatal signal
+   * would crash the test process: see signal_handler.h), then completes the raw file the way the
+   * next launch's upload does. */
+  forgeops_signal_handler_install(dir);
+  const char *data_keys[] = {"order_id"};
+  const char *data_values[] = {"42"};
+  forgeops_tracker_add_breadcrumb("charging card", "payment", "info", data_keys, data_values, 1);
+  forgeops_tracker_add_breadcrumb("about to crash", NULL, "warning", NULL, NULL, 0);
+  forgeops_signal_handler_write_report(11);
+
+  DIR *directory = opendir(dir);
+  ASSERT_NOT_NULL(directory);
+  char raw_path[512] = {0};
+  struct dirent *entry;
+  while ((entry = readdir(directory)) != NULL) {
+    if (strncmp(entry->d_name, "signal-11-", 10) == 0) snprintf(raw_path, sizeof(raw_path), "%s/%s", dir, entry->d_name);
+  }
+  closedir(directory);
+  ASSERT_TRUE(raw_path[0] != '\0');
+
+  char *json = forgeops_signal_handler_complete_json(config, raw_path);
+  ASSERT_NOT_NULL(json);
+  ASSERT_TRUE(strstr(json, "\"breadcrumbs\":[{\"category\":\"payment\",\"message\":\"charging card\"") != NULL);
+  ASSERT_TRUE(strstr(json, "},{\"category\":\"custom\",\"message\":\"about to crash\",\"level\":\"warning\"") != NULL);
+  ASSERT_TRUE(strstr(json, "\"data\":{\"order_id\":\"42\"}") != NULL);
+  /* The breadcrumb lines are their own field, never mistaken for backtrace frames. */
+  ASSERT_TRUE(strstr(json, "\"method\":\"#breadcrumb") == NULL);
+
+  free(json);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_a_raw_signal_report_with_no_trail_has_no_breadcrumbs_key) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("signal-empty", dir, sizeof(dir));
+
+  forgeops_signal_handler_install(dir);
+  forgeops_signal_handler_write_report(6);
+
+  DIR *directory = opendir(dir);
+  ASSERT_NOT_NULL(directory);
+  char raw_path[512] = {0};
+  struct dirent *entry;
+  while ((entry = readdir(directory)) != NULL) {
+    if (strncmp(entry->d_name, "signal-6-", 9) == 0) snprintf(raw_path, sizeof(raw_path), "%s/%s", dir, entry->d_name);
+  }
+  closedir(directory);
+
+  char *json = forgeops_signal_handler_complete_json(config, raw_path);
+  ASSERT_NOT_NULL(json);
+  ASSERT_TRUE(strstr(json, "\"breadcrumbs\"") == NULL);
+
+  free(json);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(breadcrumbs_a_truncated_breadcrumb_line_in_a_raw_report_is_dropped_not_spliced_into_the_json) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("signal-truncated", dir, sizeof(dir));
+  mkdir(dir, 0755);
+  char raw_path[512];
+  snprintf(raw_path, sizeof(raw_path), "%s/signal-11-1.txt", dir);
+  FILE *f = fopen(raw_path, "w");
+  ASSERT_NOT_NULL(f);
+  fputs("Segmentation fault: 11\n", f);
+  fputs("#breadcrumb {\"category\":\"custom\",\"message\":\"complete\",\"level\":\"info\",\"timestamp\":\"t\",\"data\":{}}\n", f);
+  fputs("#breadcrumb {\"category\":\"custom\",\"message\":\"cut off mid-wri", f);
+  fclose(f);
+
+  char *json = forgeops_signal_handler_complete_json(config, raw_path);
+  ASSERT_NOT_NULL(json);
+  ASSERT_TRUE(strstr(json, "\"message\":\"complete\"") != NULL);
+  ASSERT_TRUE(strstr(json, "cut off") == NULL);
+
+  free(json);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+/* ---- Performance monitoring ----------------------------------------------------------------------- */
+
+/* Like start_test_server, but serves status_count connections then exits, writing each request's
+ * body to body_path (overwriting), so a test can read back exactly what was delivered. */
+static int start_capturing_test_server(const int *status_codes, size_t status_count, const char *body_path, pid_t *child_pid_out) {
+  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  int reuse = 1;
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
+  listen(listen_fd, 4);
+
+  socklen_t addr_len = sizeof(addr);
+  getsockname(listen_fd, (struct sockaddr *)&addr, &addr_len);
+  int port = ntohs(addr.sin_port);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    for (size_t served = 0; served < status_count; served++) {
+      int client_fd = accept(listen_fd, NULL, NULL);
+      if (client_fd < 0) break;
+
+      static char buf[65536];
+      size_t total = 0;
+      char *header_end = NULL;
+      long content_length = 0;
+      ssize_t n;
+      while ((n = read(client_fd, buf + total, sizeof(buf) - total - 1)) > 0) {
+        total += (size_t)n;
+        buf[total] = '\0';
+        if (header_end == NULL) {
+          header_end = strstr(buf, "\r\n\r\n");
+          const char *cl_header = header_end != NULL ? strstr(buf, "Content-Length:") : NULL;
+          if (cl_header != NULL) content_length = strtol(cl_header + strlen("Content-Length:"), NULL, 10);
+        }
+        if (header_end != NULL && (long)(total - (size_t)(header_end + 4 - buf)) >= content_length) break;
+      }
+
+      FILE *out = fopen(body_path, "w");
+      if (out != NULL) {
+        if (header_end != NULL) fwrite(header_end + 4, 1, total - (size_t)(header_end + 4 - buf), out);
+        fclose(out);
+      }
+
+      char response[128];
+      snprintf(response, sizeof(response), "HTTP/1.1 %d OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_codes[served]);
+      write(client_fd, response, strlen(response));
+      close(client_fd);
+    }
+    close(listen_fd);
+    _exit(0);
+  }
+
+  close(listen_fd);
+  *child_pid_out = pid;
+  return port;
+}
+
+static char *read_whole_file(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (f == NULL) return NULL;
+  char *contents = calloc(1, 65536);
+  size_t n = fread(contents, 1, 65535, f);
+  contents[n] = '\0';
+  fclose(f);
+  return contents;
+}
+
+/* An enabled tracker pointed at `port` (0 = nothing listening), flush interval long enough that no
+ * test is ever flushed by the background thread unless it asks for that. */
+static forgeops_configuration_t *performance_test_setup(int port) {
+  forgeops_tracker_reset_for_testing();
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  char dsn[256];
+  snprintf(dsn, sizeof(dsn), "http://key@127.0.0.1:%d/api/v1/events", port == 0 ? 1 : port);
+  forgeops_configuration_set_dsn(config, dsn);
+  free(config->environment);
+  config->environment = strdup("production");
+  config->performance_flush_interval_seconds = 3600;
+  config->timeout_seconds = 2;
+  return config;
+}
+
+TEST(performance_record_buckets_by_transaction_name_with_count_sum_and_max) {
+  performance_test_setup(0);
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /users/:id", 10.0);
+  forgeops_tracker_record_performance("GET /users/:id", 30.0);
+  forgeops_tracker_record_performance("POST /orders", 5.0);
+
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /users/:id", &count, &sum, &max));
+  ASSERT_TRUE(count == 2 && sum == 40.0 && max == 30.0);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("POST /orders", &count, &sum, &max));
+  ASSERT_TRUE(count == 1 && sum == 5.0 && max == 5.0);
+
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_record_does_nothing_when_track_performance_is_off) {
+  forgeops_configuration_t *config = performance_test_setup(0);
+  config->track_performance = 0;
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max));
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_record_does_nothing_when_reporting_is_not_enabled_for_this_environment) {
+  forgeops_configuration_t *config = performance_test_setup(0);
+  free(config->environment);
+  config->environment = strdup("development");
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max));
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_a_new_transaction_name_past_the_cap_is_dropped_but_existing_ones_keep_counting) {
+  performance_test_setup(0);
+  unsigned long count;
+  double sum, max;
+
+  for (int i = 0; i < FORGEOPS_PERFORMANCE_MAX_TRANSACTIONS + 25; i++) {
+    char name[32];
+    snprintf(name, sizeof(name), "name-%d", i);
+    forgeops_tracker_record_performance(name, 1.0);
+  }
+  forgeops_tracker_record_performance("name-0", 1.0);
+
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("name-0", &count, &sum, &max) && count == 2);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("name-499", &count, &sum, &max));
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("name-500", &count, &sum, &max));
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_the_timer_records_how_long_the_bracketed_work_took) {
+  performance_test_setup(0);
+  unsigned long count;
+  double sum, max;
+
+  forgeops_performance_timer_t timer = forgeops_tracker_performance_start("timed");
+  usleep(30000);
+  forgeops_tracker_performance_stop(&timer);
+  forgeops_tracker_performance_stop(&timer); /* a second stop on the same timer records nothing */
+  forgeops_tracker_performance_stop(NULL);   /* and a NULL timer is safe */
+
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("timed", &count, &sum, &max));
+  ASSERT_TRUE(count == 1);
+  ASSERT_TRUE(sum >= 25.0 && sum < 1000.0);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_flush_delivers_one_batch_to_performance_samples_and_empties_the_buckets) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-body-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  forgeops_configuration_t *config = performance_test_setup(port);
+  free(config->release);
+  config->release = strdup("a1b2c3d");
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /users/:id", 10.0);
+  forgeops_tracker_record_performance("GET /users/:id", 30.0);
+  forgeops_tracker_flush_performance();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strncmp(body, "{\"samples\":[{", 13) == 0);
+  ASSERT_TRUE(strstr(body, "\"transaction_name\":\"GET /users/:id\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"request_count\":2") != NULL);
+  ASSERT_TRUE(strstr(body, "\"duration_sum_ms\":40.000") != NULL);
+  ASSERT_TRUE(strstr(body, "\"max_duration_ms\":30.000") != NULL);
+  ASSERT_TRUE(strstr(body, "\"environment\":\"production\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"release\":\"a1b2c3d\"") != NULL);
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /users/:id", &count, &sum, &max));
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_flush_does_nothing_when_there_is_nothing_to_send) {
+  performance_test_setup(0);
+
+  forgeops_tracker_flush_performance(); /* nothing is listening: a delivery attempt would only fail, but none should be made */
+
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_a_failed_delivery_keeps_every_bucket_so_the_next_flush_carries_more) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-retry-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {500, 202};
+  int port = start_capturing_test_server(statuses, 2, body_path, &child);
+  performance_test_setup(port);
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+  forgeops_tracker_flush_performance();
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max) && count == 1);
+
+  forgeops_tracker_record_performance("GET /x", 20.0);
+  forgeops_tracker_flush_performance();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"request_count\":2") != NULL);
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max));
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+static void record_during_delivery(void) {
+  forgeops_tracker_record_performance("GET /x", 25.0);  /* same transaction, mid-delivery */
+  forgeops_tracker_record_performance("GET /new", 7.0); /* a brand-new one, mid-delivery */
+}
+
+TEST(performance_a_record_that_lands_during_delivery_is_never_lost) {
+  /* Deterministic reproduction of the race forgeops_performance_flush's own comment describes: the
+   * before-delivery hook runs strictly between the snapshot and delivery succeeding, exactly where
+   * a record from another thread could land. */
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-race-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  performance_test_setup(port);
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+  forgeops_performance_set_before_delivery_hook_for_testing(record_during_delivery);
+  forgeops_tracker_flush_performance();
+  waitpid(child, NULL, 0);
+
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max));
+  ASSERT_TRUE(count == 1 && sum == 25.0 && max == 25.0);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /new", &count, &sum, &max));
+  ASSERT_TRUE(count == 1 && sum == 7.0);
+
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_the_background_thread_flushes_on_its_own_interval) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-thread-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  forgeops_configuration_t *config = performance_test_setup(port);
+  config->performance_flush_interval_seconds = 1;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+  waitpid(child, NULL, 0); /* returns once the server has served the thread's own flush */
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"transaction_name\":\"GET /x\"") != NULL);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(performance_samples_url_swaps_the_trailing_events_segment) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  forgeops_configuration_set_dsn(config, "https://key@tracker.example.com/api/v1/events");
+
+  char *url = forgeops_configuration_performance_samples_url(config);
+  ASSERT_NOT_NULL(url);
+  ASSERT_STREQ(url, "https://tracker.example.com/api/v1/performance_samples");
+  free(url);
+
+  forgeops_configuration_set_dsn(config, NULL);
+  ASSERT_NULL(forgeops_configuration_performance_samples_url(config));
+  forgeops_configuration_destroy(config);
+}
+
+TEST(performance_reset_for_testing_stops_the_thread_and_clears_every_bucket) {
+  performance_test_setup(0);
+  unsigned long count;
+  double sum, max;
+  forgeops_tracker_record_performance("GET /x", 10.0);
+
+  forgeops_tracker_reset_for_testing();
+
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max));
+}
+
+/* ---- Distributed tracing -------------------------------------------------------------------------- */
+
+/* An enabled tracker pointed at `port` (0 = nothing listening), sending any trace at all (threshold 10ms). */
+static forgeops_configuration_t *tracing_test_setup(int port) {
+  forgeops_configuration_t *config = performance_test_setup(port);
+  config->trace_capture_threshold_ms = 10;
+  return config;
+}
+
+/* Copies the string value of "key" from the span object named span_name in body into out ("null" for a JSON null). */
+static int span_field(const char *body, const char *span_name, const char *key, char *out, size_t out_size) {
+  char needle[128];
+  snprintf(needle, sizeof(needle), "\"name\":\"%s\"", span_name);
+  const char *at = strstr(body, needle);
+  if (at == NULL) return 0;
+  const char *start = at;
+  while (start > body && strncmp(start, "{\"span_id\":", 11) != 0) start--;
+  snprintf(needle, sizeof(needle), "\"%s\":", key);
+  const char *field = strstr(start, needle);
+  if (field == NULL) return 0;
+  field += strlen(needle);
+  if (*field == '"') {
+    field++;
+    size_t n = 0;
+    while (field[n] != '"' && n + 1 < out_size) { out[n] = field[n]; n++; }
+    out[n] = '\0';
+  } else {
+    snprintf(out, out_size, "null");
+  }
+  return 1;
+}
+
+TEST(tracing_a_slow_trace_is_delivered_to_spans_with_nested_spans_and_the_wire_shape) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-spans-body-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  forgeops_configuration_t *config = tracing_test_setup(port);
+  free(config->release);
+  config->release = strdup("a1b2c3d");
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  ASSERT_TRUE(trace.owns);
+  forgeops_span_t outer = forgeops_tracker_span_start("charge", "service");
+  forgeops_tracker_record_span("SELECT users", "database", 1700000000123LL, 3.0, NULL, NULL, 0);
+  usleep(30000);
+  const char *keys[] = {"order"};
+  const char *values[] = {"42"};
+  forgeops_tracker_span_stop_with_data(&outer, keys, values, 1);
+  forgeops_tracker_record_span("sibling", "database", 1700000000123LL, 1.0, NULL, NULL, 0);
+  forgeops_tracker_trace_stop(&trace, "GET /checkout");
+  ASSERT_TRUE(!forgeops_spans_active_for_testing());
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strncmp(body, "{\"trace_id\":\"", 13) == 0);
+  ASSERT_TRUE(body[13 + 32] == '"');
+  char root_id[40], charge_id[40], parent[40], value[64];
+  ASSERT_TRUE(span_field(body, "GET /checkout", "span_id", root_id, sizeof(root_id)));
+  ASSERT_TRUE(strlen(root_id) == 16);
+  ASSERT_TRUE(span_field(body, "GET /checkout", "parent_span_id", parent, sizeof(parent)) && strcmp(parent, "null") == 0);
+  ASSERT_TRUE(span_field(body, "GET /checkout", "kind", value, sizeof(value)) && strcmp(value, "controller") == 0);
+  ASSERT_TRUE(span_field(body, "charge", "span_id", charge_id, sizeof(charge_id)));
+  ASSERT_TRUE(span_field(body, "charge", "parent_span_id", parent, sizeof(parent)) && strcmp(parent, root_id) == 0);
+  ASSERT_TRUE(span_field(body, "SELECT users", "parent_span_id", parent, sizeof(parent)) && strcmp(parent, charge_id) == 0);
+  ASSERT_TRUE(span_field(body, "sibling", "parent_span_id", parent, sizeof(parent)) && strcmp(parent, root_id) == 0);
+  ASSERT_TRUE(span_field(body, "SELECT users", "started_at", value, sizeof(value)) && strcmp(value, "2023-11-14T22:13:20.123Z") == 0);
+  ASSERT_TRUE(strstr(body, "\"environment\":\"production\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"release\":\"a1b2c3d\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"data\":{\"order\":\"42\"}") != NULL);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_an_unknown_or_null_kind_is_sent_as_other_since_the_server_would_reject_the_whole_trace) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-spans-kind-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  tracing_test_setup(port);
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  forgeops_tracker_record_span("q", "db", 1700000000000LL, 1.0, NULL, NULL, 0);
+  forgeops_tracker_record_span("n", NULL, 1700000000000LL, 1.0, NULL, NULL, 0);
+  forgeops_tracker_record_span("r", "database", 1700000000000LL, 1.0, NULL, NULL, 0);
+  usleep(20000);
+  forgeops_tracker_trace_stop(&trace, "root");
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  char kind[32];
+  ASSERT_TRUE(span_field(body, "q", "kind", kind, sizeof(kind)) && strcmp(kind, "other") == 0);
+  ASSERT_TRUE(span_field(body, "n", "kind", kind, sizeof(kind)) && strcmp(kind, "other") == 0);
+  ASSERT_TRUE(span_field(body, "r", "kind", kind, sizeof(kind)) && strcmp(kind, "database") == 0);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_a_trace_under_the_threshold_is_never_queued_and_leaves_nothing_open) {
+  forgeops_configuration_t *config = tracing_test_setup(0);
+  config->trace_capture_threshold_ms = 60000;
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  ASSERT_TRUE(trace.owns);
+  forgeops_tracker_record_span("q", "database", 1700000000000LL, 1.0, NULL, NULL, 0);
+  forgeops_tracker_trace_stop(&trace, "GET /fast");
+
+  ASSERT_TRUE(!forgeops_spans_active_for_testing());
+  ASSERT_TRUE(!forgeops_spans_worker_started_for_testing());
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_track_tracing_off_or_reporting_disabled_starts_no_trace_and_every_call_is_a_no_op) {
+  forgeops_configuration_t *config = tracing_test_setup(0);
+  config->track_tracing = 0;
+
+  forgeops_trace_t off = forgeops_tracker_trace_start();
+  ASSERT_TRUE(!off.owns);
+  ASSERT_TRUE(!forgeops_spans_active_for_testing());
+  forgeops_span_t span = forgeops_tracker_span_start("x", "service");
+  ASSERT_TRUE(!span.state.active);
+  forgeops_tracker_span_stop(&span);
+  forgeops_tracker_record_span("y", "database", 1700000000000LL, 1.0, NULL, NULL, 0);
+  forgeops_tracker_trace_stop(&off, "root");
+
+  config->track_tracing = 1;
+  free(config->environment);
+  config->environment = strdup("development");
+  forgeops_trace_t disabled = forgeops_tracker_trace_start();
+  ASSERT_TRUE(!disabled.owns);
+  ASSERT_TRUE(!forgeops_spans_active_for_testing());
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_a_span_outside_a_trace_is_a_harmless_no_op) {
+  tracing_test_setup(0);
+  forgeops_span_t span = forgeops_tracker_span_start("free", "service");
+  ASSERT_TRUE(!span.state.active);
+  forgeops_tracker_span_stop(&span);
+  forgeops_tracker_span_stop(NULL);
+  forgeops_tracker_trace_stop(NULL, "x");
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_a_nested_trace_start_does_not_start_a_second_trace_and_its_stop_does_nothing) {
+  tracing_test_setup(0);
+  forgeops_trace_t outer = forgeops_tracker_trace_start();
+  forgeops_trace_t inner = forgeops_tracker_trace_start();
+  ASSERT_TRUE(outer.owns);
+  ASSERT_TRUE(!inner.owns);
+
+  forgeops_tracker_trace_stop(&inner, "inner");
+  ASSERT_TRUE(forgeops_spans_active_for_testing());
+  forgeops_tracker_trace_stop(&outer, "outer");
+  ASSERT_TRUE(!forgeops_spans_active_for_testing());
+  forgeops_tracker_trace_stop(&outer, "outer"); /* a second stop on the same trace does nothing */
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_a_trace_holds_at_most_500_spans_including_the_root) {
+  tracing_test_setup(0);
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  for (int i = 0; i < 700; i++) forgeops_tracker_record_span("q", "database", 1700000000000LL, 1.0, NULL, NULL, 0);
+  ASSERT_TRUE(forgeops_spans_count_for_testing() == 499);
+  forgeops_tracker_trace_stop(&trace, "root");
+  forgeops_tracker_reset_for_testing();
+}
+
+static void *check_no_trace_on_this_thread(void *result) {
+  *(int *)result = forgeops_spans_active_for_testing() == 0;
+  return NULL;
+}
+
+TEST(tracing_the_open_trace_is_per_thread) {
+  tracing_test_setup(0);
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  int other_thread_saw_no_trace = 0;
+  pthread_t thread;
+  pthread_create(&thread, NULL, check_no_trace_on_this_thread, &other_thread_saw_no_trace);
+  pthread_join(thread, NULL);
+  ASSERT_TRUE(other_thread_saw_no_trace);
+  forgeops_tracker_trace_stop(&trace, "root");
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_spans_url_swaps_the_trailing_events_segment) {
+  tracing_test_setup(0);
+  char *url = forgeops_configuration_spans_url(forgeops_tracker_configuration());
+  ASSERT_NOT_NULL(url);
+  ASSERT_TRUE(strcmp(url, "http://127.0.0.1:1/api/v1/spans") == 0);
+  free(url);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_an_ended_span_state_is_cleared_so_a_second_stop_records_nothing) {
+  tracing_test_setup(0);
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  forgeops_span_t span = forgeops_tracker_span_start("once", "service");
+  forgeops_tracker_span_stop(&span);
+  forgeops_tracker_span_stop(&span);
+  ASSERT_TRUE(forgeops_spans_count_for_testing() == 1);
+  forgeops_tracker_trace_stop(&trace, "root");
+  forgeops_tracker_reset_for_testing();
+}
+
+/* ---- Custom metrics and infrastructure monitoring ------------------------------------------------- */
+
+static forgeops_configuration_t *metrics_test_setup(int port) {
+  forgeops_configuration_t *config = performance_test_setup(port);
+  config->metric_flush_interval_seconds = 3600;
+  config->infrastructure_metric_flush_interval_seconds = 3600;
+  free(config->server_name);
+  config->server_name = strdup("web-1");
+  free(config->release);
+  config->release = strdup("a1b2c3d");
+  return config;
+}
+
+TEST(metrics_flush_delivers_every_entry_as_one_batch_to_custom_metrics_with_the_wire_shape) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-metrics-body-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  metrics_test_setup(port);
+
+  forgeops_tracker_capture_metric("signup", 1.0);
+  forgeops_tracker_capture_metric("payment", 49.5);
+  forgeops_tracker_capture_metric("refund", -12.0);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 3);
+  forgeops_tracker_flush_metrics();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strncmp(body, "{\"metrics\":[{\"metric_name\":\"signup\",\"value\":1,", 44) == 0);
+  ASSERT_TRUE(strstr(body, "\"metric_name\":\"payment\",\"value\":49.5,") != NULL);
+  ASSERT_TRUE(strstr(body, "\"value\":-12,") != NULL);
+  ASSERT_TRUE(strstr(body, "\"environment\":\"production\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"release\":\"a1b2c3d\"") != NULL);
+  const char *stamp = strstr(body, "\"recorded_at\":\"");
+  ASSERT_NOT_NULL(stamp);
+  ASSERT_TRUE(stamp[15 + 19] == 'Z' && stamp[15 + 10] == 'T');
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 0);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(metrics_infrastructure_readings_go_to_their_own_endpoint_with_an_explicit_or_default_hostname) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-infra-body-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  metrics_test_setup(port);
+
+  forgeops_tracker_capture_infrastructure_metric("cpu", 0.42, "db-1");
+  forgeops_tracker_capture_infrastructure_metric("memory", 0.7, NULL);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 0);
+  forgeops_tracker_flush_metrics();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"metric_name\":\"cpu\",\"value\":0.41999999999999998,\"hostname\":\"db-1\"") != NULL || strstr(body, "\"metric_name\":\"cpu\",\"value\":0.42,\"hostname\":\"db-1\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"hostname\":\"web-1\"") != NULL);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(metrics_a_nan_or_infinite_value_is_dropped_and_a_null_name_is_ignored) {
+  metrics_test_setup(0);
+  forgeops_tracker_capture_metric("nan", NAN);
+  forgeops_tracker_capture_metric("inf", INFINITY);
+  forgeops_tracker_capture_metric(NULL, 1.0);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 0);
+  forgeops_tracker_capture_metric("ok", 3.0);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 1);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(metrics_a_failed_delivery_keeps_every_entry_so_the_next_flush_carries_more) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-metrics-retry-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {500, 202};
+  int port = start_capturing_test_server(statuses, 2, body_path, &child);
+  metrics_test_setup(port);
+
+  forgeops_tracker_capture_metric("a", 1.0);
+  forgeops_tracker_flush_metrics();
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 1);
+  forgeops_tracker_capture_metric("b", 2.0);
+  forgeops_tracker_flush_metrics();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"metric_name\":\"a\"") != NULL && strstr(body, "\"metric_name\":\"b\"") != NULL);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 0);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+static void capture_during_delivery(void) {
+  forgeops_tracker_capture_metric("during", 2.0);
+}
+
+TEST(metrics_an_entry_captured_while_delivery_is_in_flight_is_never_lost) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-metrics-inflight-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  metrics_test_setup(port);
+
+  forgeops_tracker_capture_metric("first", 1.0);
+  forgeops_metrics_set_before_delivery_hook_for_testing(capture_during_delivery);
+  forgeops_tracker_flush_metrics();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"metric_name\":\"first\"") != NULL && strstr(body, "\"metric_name\":\"during\"") == NULL);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 1);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(metrics_a_buffer_is_capped_and_drops_further_entries_until_a_flush_succeeds) {
+  metrics_test_setup(0);
+  for (int i = 0; i < FORGEOPS_METRICS_MAX_ENTRIES + 50; i++) forgeops_tracker_capture_metric("m", 1.0);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == FORGEOPS_METRICS_MAX_ENTRIES);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(metrics_captures_are_a_no_op_when_reporting_is_not_enabled_for_this_environment) {
+  forgeops_configuration_t *config = metrics_test_setup(0);
+  free(config->environment);
+  config->environment = strdup("development");
+  forgeops_tracker_capture_metric("signup", 1.0);
+  forgeops_tracker_capture_infrastructure_metric("cpu", 1.0, NULL);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 0);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_INFRASTRUCTURE) == 0);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(metrics_urls_swap_the_trailing_events_segment) {
+  metrics_test_setup(0);
+  char *custom = forgeops_configuration_custom_metrics_url(forgeops_tracker_configuration());
+  char *infrastructure = forgeops_configuration_infrastructure_metrics_url(forgeops_tracker_configuration());
+  ASSERT_TRUE(custom != NULL && strcmp(custom, "http://127.0.0.1:1/api/v1/custom_metrics") == 0);
+  ASSERT_TRUE(infrastructure != NULL && strcmp(infrastructure, "http://127.0.0.1:1/api/v1/infrastructure_metrics") == 0);
+  free(custom);
+  free(infrastructure);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(metrics_a_program_that_captures_a_reading_and_just_exits_still_delivers_it_from_its_atexit_hook) {
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+  /* ThreadSanitizer's fork() support in a process that has run threads before hangs the forked child
+   * (a documented TSan limitation, not a defect here); the same test passes under ASan/UBSan and
+   * without a sanitizer. */
+  return;
+#endif
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-metrics-exit-%d.json", getpid());
+  pid_t server;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &server);
+
+  fflush(NULL);
+  pid_t child = fork();
+  if (child == 0) {
+    metrics_test_setup(port);
+    forgeops_tracker_capture_infrastructure_metric("cpu", 0.5, "cron-1");
+    exit(0); /* not _exit: the atexit hook is the thing under test */
+  }
+  waitpid(child, NULL, 0);
+  waitpid(server, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"hostname\":\"cron-1\"") != NULL);
+  free(body);
+  remove(body_path);
 }
 
 int main(void) {
@@ -739,6 +1954,7 @@ int main(void) {
   RUN(event_builder_scrubs_message_and_context_by_default);
   RUN(event_builder_leaves_payload_untouched_when_scrub_pii_disabled);
   RUN(event_builder_never_attaches_source_context_in_practice);
+  RUN(event_builder_includes_the_user_when_given_one_never_scrubbed_even_though_its_an_email);
   RUN(source_context_attaches_window_around_the_culprit_line_by_default);
   RUN(source_context_clamps_at_file_boundaries_rather_than_crashing);
   RUN(source_context_truncates_a_line_longer_than_max_context_line_length);
@@ -757,11 +1973,69 @@ int main(void) {
 
   RUN(reporter_report_does_nothing_when_disabled);
   RUN(reporter_report_writes_a_pending_report_when_enabled);
+  RUN(reporter_report_includes_the_given_user_never_scrubbed_even_though_its_an_email);
   RUN(reporter_upload_pending_reports_delivers_and_deletes_on_success);
   RUN(reporter_upload_pending_reports_leaves_file_on_failure);
 
   RUN(tracker_capture_error_delivers_through_the_full_stack);
+  RUN(tracker_set_user_attaches_the_user_to_a_later_capture_error_call);
+  RUN(tracker_an_explicit_user_argument_overrides_whatever_set_user_last_set);
+  RUN(tracker_reset_for_testing_clears_the_current_user);
   RUN(tracker_install_handlers_is_idempotent);
+
+  RUN(performance_record_buckets_by_transaction_name_with_count_sum_and_max);
+  RUN(performance_record_does_nothing_when_track_performance_is_off);
+  RUN(performance_record_does_nothing_when_reporting_is_not_enabled_for_this_environment);
+  RUN(performance_a_new_transaction_name_past_the_cap_is_dropped_but_existing_ones_keep_counting);
+  RUN(performance_the_timer_records_how_long_the_bracketed_work_took);
+  RUN(performance_flush_delivers_one_batch_to_performance_samples_and_empties_the_buckets);
+  RUN(performance_flush_does_nothing_when_there_is_nothing_to_send);
+  RUN(performance_a_failed_delivery_keeps_every_bucket_so_the_next_flush_carries_more);
+  RUN(performance_a_record_that_lands_during_delivery_is_never_lost);
+  RUN(performance_the_background_thread_flushes_on_its_own_interval);
+  RUN(performance_samples_url_swaps_the_trailing_events_segment);
+  RUN(performance_reset_for_testing_stops_the_thread_and_clears_every_bucket);
+
+  RUN(breadcrumbs_add_attaches_the_trail_to_a_later_capture_error_call);
+  RUN(breadcrumbs_null_category_and_level_default_to_custom_and_info);
+  RUN(breadcrumbs_keep_only_the_most_recent_max_breadcrumbs_dropping_the_oldest);
+  RUN(breadcrumbs_wrap_around_the_ring_many_times_and_stay_in_order);
+  RUN(breadcrumbs_record_nothing_when_track_breadcrumbs_is_off);
+  RUN(breadcrumbs_clear_empties_the_trail_and_the_report_carries_no_breadcrumbs_key);
+  RUN(breadcrumbs_scrub_message_and_data_when_added_but_not_category_or_level);
+  RUN(breadcrumbs_leave_values_untouched_when_scrub_pii_is_off);
+  RUN(breadcrumbs_escape_quotes_and_control_characters_into_valid_json);
+  RUN(breadcrumbs_an_oversized_entry_is_shrunk_to_fit_its_slot_never_overflowing_it);
+  RUN(breadcrumbs_truncation_never_cuts_a_multibyte_utf8_character_in_half);
+  RUN(breadcrumbs_are_isolated_per_thread);
+  RUN(breadcrumbs_reset_for_testing_clears_the_trail);
+  RUN(breadcrumbs_event_builder_includes_the_given_trail_and_omits_the_key_when_empty);
+  RUN(breadcrumbs_a_fatal_signals_raw_report_carries_the_crashing_threads_trail);
+  RUN(breadcrumbs_a_raw_signal_report_with_no_trail_has_no_breadcrumbs_key);
+  RUN(breadcrumbs_a_truncated_breadcrumb_line_in_a_raw_report_is_dropped_not_spliced_into_the_json);
+
+
+  RUN(tracing_a_slow_trace_is_delivered_to_spans_with_nested_spans_and_the_wire_shape);
+  RUN(tracing_an_unknown_or_null_kind_is_sent_as_other_since_the_server_would_reject_the_whole_trace);
+  RUN(tracing_a_trace_under_the_threshold_is_never_queued_and_leaves_nothing_open);
+  RUN(tracing_track_tracing_off_or_reporting_disabled_starts_no_trace_and_every_call_is_a_no_op);
+  RUN(tracing_a_span_outside_a_trace_is_a_harmless_no_op);
+  RUN(tracing_a_nested_trace_start_does_not_start_a_second_trace_and_its_stop_does_nothing);
+  RUN(tracing_a_trace_holds_at_most_500_spans_including_the_root);
+  RUN(tracing_the_open_trace_is_per_thread);
+  RUN(tracing_spans_url_swaps_the_trailing_events_segment);
+  RUN(tracing_an_ended_span_state_is_cleared_so_a_second_stop_records_nothing);
+
+
+  RUN(metrics_flush_delivers_every_entry_as_one_batch_to_custom_metrics_with_the_wire_shape);
+  RUN(metrics_infrastructure_readings_go_to_their_own_endpoint_with_an_explicit_or_default_hostname);
+  RUN(metrics_a_nan_or_infinite_value_is_dropped_and_a_null_name_is_ignored);
+  RUN(metrics_a_failed_delivery_keeps_every_entry_so_the_next_flush_carries_more);
+  RUN(metrics_an_entry_captured_while_delivery_is_in_flight_is_never_lost);
+  RUN(metrics_a_buffer_is_capped_and_drops_further_entries_until_a_flush_succeeds);
+  RUN(metrics_captures_are_a_no_op_when_reporting_is_not_enabled_for_this_environment);
+  RUN(metrics_urls_swap_the_trailing_events_segment);
+  RUN(metrics_a_program_that_captures_a_reading_and_just_exits_still_delivers_it_from_its_atexit_hook);
 
   printf("\n%d run, %d failed\n", g_tests_run, g_tests_failed);
   return g_tests_failed == 0 ? 0 : 1;

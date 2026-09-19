@@ -46,7 +46,15 @@ forgeops_configuration_t *forgeops_configuration_create(void) {
 
   config->scrub_pii = 1;
   config->capture_source_context = 1;
-  config->timeout_seconds = 5; /* longer than the request-based clients' ~2s -- see the Objective-C/Swift clients' own identical reasoning: this fires on the *next* launch after a crash, not inline with a live request */
+  config->track_breadcrumbs = 1;
+  config->track_performance = 1;
+  config->performance_flush_interval_seconds = 60;
+  config->track_tracing = 1;
+  config->trace_capture_threshold_ms = 1000;
+  config->metric_flush_interval_seconds = 60;
+  config->infrastructure_metric_flush_interval_seconds = 60;
+  config->max_breadcrumbs = 30;
+  config->timeout_seconds = 5; /* longer than the request-based clients' ~2s: see the Objective-C/Swift clients' own identical reasoning: this fires on the *next* launch after a crash, not inline with a live request */
 
   config->enabled_environment_count = 2;
   config->enabled_environments = calloc(2, sizeof(char *));
@@ -77,7 +85,7 @@ void forgeops_configuration_set_dsn(forgeops_configuration_t *config, const char
   config->dsn = dup_or_null(dsn);
 }
 
-/* Hand-parses a DSN of the form "scheme://api_key@host[:port]/path[?query]" -- the shape is fixed
+/* Hand-parses a DSN of the form "scheme://api_key@host[:port]/path[?query]": the shape is fixed
  * and simple enough that a small dependency-free parser is clearer here than pulling in a URL
  * library, the same spirit as the Perl/Rust clients' own dependency-free DSN parsing.
  *
@@ -114,7 +122,7 @@ static int hex_digit(char c) {
   return -1;
 }
 
-/* Minimal percent-decoding for a DSN's userinfo component -- the only place this client ever
+/* Minimal percent-decoding for a DSN's userinfo component: the only place this client ever
  * needs it, not a general-purpose URL decoder. */
 static char *percent_decode(const char *start, const char *end) {
   size_t len = (size_t)(end - start);
@@ -143,7 +151,7 @@ char *forgeops_configuration_api_key(const forgeops_configuration_t *config) {
 
   const char *scheme_end, *userinfo_start, *userinfo_end, *host_start;
   if (split_dsn(config->dsn, &scheme_end, &userinfo_start, &userinfo_end, &host_start) != 0) return NULL;
-  if (userinfo_start == userinfo_end) return NULL; /* no "@" -- no userinfo at all */
+  if (userinfo_start == userinfo_end) return NULL; /* no "@": no userinfo at all */
 
   char *decoded = percent_decode(userinfo_start, userinfo_end);
   if (decoded != NULL && decoded[0] == '\0') {
@@ -168,6 +176,76 @@ char *forgeops_configuration_ingestion_url(const forgeops_configuration_t *confi
   memcpy(url + scheme_len, "://", 3);
   memcpy(url + scheme_len + 3, host_start, rest_len + 1); /* +1 copies the trailing NUL too */
   return url;
+}
+
+char *forgeops_configuration_performance_samples_url(const forgeops_configuration_t *config) {
+  char *url = forgeops_configuration_ingestion_url(config);
+  if (url == NULL) return NULL;
+
+  size_t length = strlen(url);
+  const char *suffix = "/events";
+  size_t suffix_length = strlen(suffix);
+  if (length < suffix_length || strcmp(url + length - suffix_length, suffix) != 0) return url;
+
+  const char *replacement = "/performance_samples";
+  char *swapped = malloc(length - suffix_length + strlen(replacement) + 1);
+  if (swapped == NULL) {
+    free(url);
+    return NULL;
+  }
+  memcpy(swapped, url, length - suffix_length);
+  strcpy(swapped + length - suffix_length, replacement);
+  free(url);
+  return swapped;
+}
+
+static char *swap_events_suffix(const forgeops_configuration_t *config, const char *replacement) {
+  char *url = forgeops_configuration_ingestion_url(config);
+  if (url == NULL) return NULL;
+
+  size_t length = strlen(url);
+  const char *suffix = "/events";
+  size_t suffix_length = strlen(suffix);
+  if (length < suffix_length || strcmp(url + length - suffix_length, suffix) != 0) return url;
+
+  char *swapped = malloc(length - suffix_length + strlen(replacement) + 1);
+  if (swapped == NULL) {
+    free(url);
+    return NULL;
+  }
+  memcpy(swapped, url, length - suffix_length);
+  strcpy(swapped + length - suffix_length, replacement);
+  free(url);
+  return swapped;
+}
+
+char *forgeops_configuration_custom_metrics_url(const forgeops_configuration_t *config) {
+  return swap_events_suffix(config, "/custom_metrics");
+}
+
+char *forgeops_configuration_infrastructure_metrics_url(const forgeops_configuration_t *config) {
+  return swap_events_suffix(config, "/infrastructure_metrics");
+}
+
+char *forgeops_configuration_spans_url(const forgeops_configuration_t *config) {
+  char *url = forgeops_configuration_ingestion_url(config);
+  if (url == NULL) return NULL;
+
+  size_t length = strlen(url);
+  const char *suffix = "/events";
+  size_t suffix_length = strlen(suffix);
+  if (length < suffix_length || strcmp(url + length - suffix_length, suffix) != 0) return url;
+
+  const char *replacement = "/spans";
+  char *swapped = malloc(length - suffix_length + strlen(replacement) + 1);
+  if (swapped == NULL) {
+    free(url);
+    return NULL;
+  }
+  memcpy(swapped, url, length - suffix_length);
+  strcpy(swapped + length - suffix_length, replacement);
+  free(url);
+  return swapped;
 }
 
 int forgeops_configuration_is_enabled(const forgeops_configuration_t *config) {

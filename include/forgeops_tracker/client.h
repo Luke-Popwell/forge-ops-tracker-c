@@ -4,8 +4,8 @@
 #include "forgeops_tracker/configuration.h"
 
 /*
- * Delivers one already-built JSON payload over HTTP via libcurl. Every failure mode -- DNS,
- * connection, timeout, TLS, a non-2xx response -- is caught here and turned into a 0 (false)
+ * Delivers one already-built JSON payload over HTTP via libcurl. Every failure mode: DNS,
+ * connection, timeout, TLS, a non-2xx response: is caught here and turned into a 0 (false)
  * return rather than a crash, since a broken or unreachable tracker must never be able to break
  * the host app.
  *
@@ -16,5 +16,27 @@
  * should attempt from scratch.
  */
 int forgeops_client_deliver(const forgeops_configuration_t *config, const char *json_payload);
+
+/*
+ * Same delivery contract as forgeops_client_deliver, against the DSN's performance_samples
+ * endpoint (see forgeops_configuration_performance_samples_url). json_payload is the whole request
+ * body, already encoded: {"samples":[...]}, the shape Api::V1::PerformanceSamplesController expects.
+ */
+int forgeops_client_deliver_performance_samples(const forgeops_configuration_t *config, const char *json_payload);
+
+/*
+ * Same delivery contract again, against the DSN's spans endpoint (see
+ * forgeops_configuration_spans_url). json_payload is the whole request body, already encoded:
+ * {"trace_id":...,"spans":[...]}, the shape Api::V1::SpansController expects.
+ */
+int forgeops_client_deliver_spans(const forgeops_configuration_t *config, const char *json_payload);
+
+/*
+ * Same delivery contract again, against the DSN's custom metrics and infrastructure metrics endpoints
+ * (see forgeops_configuration_custom_metrics_url). json_payload is the whole request body, already
+ * encoded: {"metrics":[...]}.
+ */
+int forgeops_client_deliver_metrics(const forgeops_configuration_t *config, const char *json_payload);
+int forgeops_client_deliver_infrastructure_metrics(const forgeops_configuration_t *config, const char *json_payload);
 
 #endif

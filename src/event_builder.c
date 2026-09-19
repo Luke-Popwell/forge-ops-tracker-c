@@ -1,7 +1,7 @@
 /*
  * Captures a real backtrace via backtrace()/backtrace_symbols() (POSIX, <execinfo.h>) and parses
- * each frame line with a regex -- e.g. "12  MyApp    0x0000000100abcd12 -[MyClass myMethod] + 82"
- * -- into an image name (closest available analog to "file"; a compiled C binary has no source
+ * each frame line with a regex: e.g. "12  MyApp    0x0000000100abcd12 -[MyClass myMethod] + 82",
+ * into an image name (closest available analog to "file"; a compiled C binary has no source
  * paths left in it) and a symbol name (closest analog to "method"). Verified directly against
  * real backtrace_symbols() output on Darwin before relying on this shape (see this SDK's own
  * README for the platform-specific caveat: the exact format is not POSIX-standardized, only
@@ -28,9 +28,16 @@
 
 #define MAX_FRAMES 64
 
+/*
+ * Identifies this client to the server's auto language-detection on the project the event lands
+ * in (see Project#note_sdk_platform server-side); matches this repo's own sdks/c directory name,
+ * the same convention every other language's client follows.
+ */
+#define FORGEOPS_SDK_NAME "c"
+
 /* How many lines of source to grab on either side of a frame's culprit line (see
  * forgeops_source_context_json), and the longest a single captured line is allowed to be before
- * getting truncated -- guards against a single pathological minified/generated line ballooning the
+ * getting truncated: guards against a single pathological minified/generated line ballooning the
  * payload. ForgeOps itself re-truncates on arrival too, the same "don't just trust the SDK"
  * posture MAX_FRAMES already gets on the server side. */
 #define CONTEXT_LINES 5
@@ -80,7 +87,7 @@ static void trim_trailing_space(char *s) {
 
 static int parse_frame_line(const regex_t *re, const char *line, frame_t *frame) {
   regmatch_t groups[3];
-  if (regexec(re, line, 3, groups, 0) != 0) return -1; /* an unparseable line is skipped, not an error -- see PHP's own client for the same philosophy */
+  if (regexec(re, line, 3, groups, 0) != 0) return -1; /* an unparseable line is skipped, not an error: see PHP's own client for the same philosophy */
 
   size_t image_len = (size_t)(groups[1].rm_eo - groups[1].rm_so);
   size_t symbol_len = (size_t)(groups[2].rm_eo - groups[2].rm_so);
@@ -102,7 +109,7 @@ static int parse_frame_line(const regex_t *re, const char *line, frame_t *frame)
 
 /* Reads a single line (any length) from `f` into a newly-allocated, NUL-terminated buffer with the
  * trailing newline (and a preceding '\r', for CRLF files) stripped. Returns NULL at EOF with
- * nothing read, or on allocation failure -- indistinguishable from plain EOF to the caller, which
+ * nothing read, or on allocation failure: indistinguishable from plain EOF to the caller, which
  * is fine: both just mean "stop reading, use whatever full lines were already collected." */
 static char *read_line(FILE *f) {
   size_t capacity = 128;
@@ -248,7 +255,7 @@ static void append_backtrace_json(forgeops_strbuf_t *out, const forgeops_configu
       }
 
       /* Always 0/-1: a compiled C binary's own image is indistinguishable from a system library's
-       * by name alone (see README.md), and it carries no source line number at all -- so this
+       * by name alone (see README.md), and it carries no source line number at all: so this
        * frame is never in_app and forgeops_source_context_json below always takes its own gated-off
        * return. Wired in anyway, exactly the way every other client in this repo wires its own
        * per-frame source context call, so this file is ready the moment a real file+line source
@@ -293,7 +300,7 @@ static void append_iso8601_now(forgeops_strbuf_t *out) {
   json_append_escaped_string(out, formatted);
 }
 
-char *forgeops_build_event_json(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count) {
+char *forgeops_build_event_json(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count) {
   forgeops_strbuf_t out;
   if (forgeops_strbuf_init(&out, 512) != 0) return NULL;
 
@@ -329,7 +336,33 @@ char *forgeops_build_event_json(const forgeops_configuration_t *config, const ch
     json_append_string_or_null(&out, scrubbed_value != NULL ? scrubbed_value : context_values[i]);
     free(scrubbed_value);
   }
-  forgeops_strbuf_append_str(&out, "},\"tags\":{}}");
+  forgeops_strbuf_append_str(&out, "},\"tags\":{},\"sdk_name\":\"" FORGEOPS_SDK_NAME "\"");
+
+  /* Never passed through forgeops_scrub_string/forgeops_is_sensitive_key the way a context value
+   * is above: a structured field the host app sets deliberately, not free text that could
+   * accidentally spill sensitive data. Omitted from the wire entirely (not even an empty object)
+   * when user_count is 0, the same "no key at all" shape every other client in this repo's own
+   * "user" field gets when absent. */
+  if (user_count > 0) {
+    forgeops_strbuf_append_str(&out, ",\"user\":{");
+    for (size_t i = 0; i < user_count; i++) {
+      if (i > 0) forgeops_strbuf_append(&out, ",", 1);
+      json_append_escaped_string(&out, user_keys[i]);
+      forgeops_strbuf_append(&out, ":", 1);
+      json_append_string_or_null(&out, user_values[i]);
+    }
+    forgeops_strbuf_append(&out, "}", 1);
+  }
+
+  if (breadcrumb_count > 0 && breadcrumb_json != NULL) {
+    forgeops_strbuf_append_str(&out, ",\"breadcrumbs\":[");
+    for (size_t i = 0; i < breadcrumb_count; i++) {
+      if (i > 0) forgeops_strbuf_append(&out, ",", 1);
+      forgeops_strbuf_append_str(&out, breadcrumb_json[i]);
+    }
+    forgeops_strbuf_append(&out, "]", 1);
+  }
+  forgeops_strbuf_append(&out, "}", 1);
 
   free(scrubbed_message);
   return out.data;

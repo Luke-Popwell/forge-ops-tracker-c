@@ -4,12 +4,12 @@
 #define FORGEOPS_REDACTED "[FILTERED]"
 
 /*
- * Redacts likely-sensitive content out of a string before it ever leaves this process -- the
+ * Redacts likely-sensitive content out of a string before it ever leaves this process: the
  * same patterns ForgeOps itself applies again on arrival (defense in depth: this layer keeps the
  * data off the wire and out of any logging in between; the server-side layer is what actually
  * protects the database). Ported from
  * gems/forge_ops_tracker/lib/forge_ops_tracker/pii_scrubber.rb, adapted for POSIX Extended
- * Regular Expressions (<regex.h>) rather than PCRE -- see pii_scrubber.c's own comment for what
+ * Regular Expressions (<regex.h>) rather than PCRE: see pii_scrubber.c's own comment for what
  * that adaptation actually changes.
  *
  * Returns a newly-allocated string the caller must free, or NULL on allocation failure. Never

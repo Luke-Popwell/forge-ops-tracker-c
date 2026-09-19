@@ -5,6 +5,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 find_package(CURL REQUIRED)
+find_package(Threads REQUIRED) # pthread_key_create, for freeing a thread's breadcrumb ring at thread exit
 
 add_library(forgeops_tracker
     src/configuration.c
@@ -13,12 +14,16 @@ add_library(forgeops_tracker
     src/crash_store.c
     src/client.c
     src/signal_handler.c
+    src/breadcrumbs.c
+    src/performance.c
+    src/spans.c
+    src/metrics.c
     src/reporter.c
     src/forgeops_tracker.c
 )
 target_include_directories(forgeops_tracker PUBLIC include)
-target_link_libraries(forgeops_tracker PUBLIC CURL::libcurl)
-# Real (not stub) backtrace symbol resolution needs frame pointers and debug info -- without
+target_link_libraries(forgeops_tracker PUBLIC CURL::libcurl Threads::Threads)
+# Real (not stub) backtrace symbol resolution needs frame pointers and debug info: without
 # -fno-omit-frame-pointer, backtrace() can silently return far fewer/wrong frames under
 # optimization, which would make event_builder's own tests flaky depending on build type.
 target_compile_options(forgeops_tracker PRIVATE -g -fno-omit-frame-pointer -Wall -Wextra)

@@ -5,21 +5,21 @@
 
 /*
  * Installs handlers for the common fatal signals (SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS,
- * SIGTRAP) that write a raw backtrace to disk -- the same approach, and largely the same code, as
+ * SIGTRAP) that write a raw backtrace to disk: the same approach, and largely the same code, as
  * this repo's own Objective-C/Swift clients' own signal handlers (sdks/objc/.../FOTSignalHandler.m,
- * sdks/swift/Sources/CFOTSignal/cfot_signal.c -- this file and that one are close enough to be the
+ * sdks/swift/Sources/CFOTSignal/cfot_signal.c: this file and that one are close enough to be the
  * same implementation ported back into this repo's plain-C client, not independently written).
  * Inside an actual signal handler, only async-signal-safe functions are safe to call at all
- * (POSIX is explicit about this) -- no malloc, nothing that could allocate or take a lock another
+ * (POSIX is explicit about this): no malloc, nothing that could allocate or take a lock another
  * thread might already hold. Everything this handler touches (the target directory, a stack
  * buffer) is prepared *before* installation, not inside the handler, and backtrace capture uses
- * backtrace_symbols_fd() specifically because -- unlike backtrace_symbols() -- it writes directly
+ * backtrace_symbols_fd() specifically because (unlike backtrace_symbols()) it writes directly
  * to a file descriptor without allocating a string array first.
  *
  * crash_reports_directory must already exist (forgeops_signal_handler_install creates it) and
  * outlive the handler installation.
  *
- * This path isn't exercised by this SDK's own automated test suite -- deliberately: actually
+ * This path isn't exercised by this SDK's own automated test suite: deliberately: actually
  * raising a fatal signal to test it would crash the test process itself, the same reason every
  * real crash reporter's signal path is validated by manual/integration crash testing, not a unit
  * test. Installation succeeding is tested; the handler's own body is not.
@@ -27,8 +27,18 @@
 void forgeops_signal_handler_install(const char *crash_reports_directory);
 
 /*
+ * The handler's own body, minus the restore-default-and-re-raise step at the end: writes the raw
+ * crash report (signal name, backtrace, and this thread's breadcrumb trail) for signal_number into
+ * the directory forgeops_signal_handler_install was given. Exposed only so a test can run the real
+ * report-writing code path in-process: actually delivering a fatal signal would crash the test
+ * process itself (see this header's own comment above). Async-signal-safe, exactly as the handler
+ * that calls it needs it to be.
+ */
+void forgeops_signal_handler_write_report(int signal_number);
+
+/*
  * Reads a raw signal-crash text file (written by the handler above) and turns it into a complete
- * JSON event payload -- filling in the fields the signal handler itself couldn't safely build
+ * JSON event payload: filling in the fields the signal handler itself couldn't safely build
  * (occurred_at, environment, release, server_name), now that it's safe to call ordinary
  * (non-async-signal-safe) functions again. Returns a newly-allocated string the caller must free,
  * or NULL if path couldn't be read.

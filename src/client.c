@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* libcurl calls this with every byte of the response body -- discarded, this client never reads
+/* libcurl calls this with every byte of the response body: discarded, this client never reads
  * a response, but a write callback still has to consume the data or curl treats it as an error. */
 static size_t discard_response(char *ptr, size_t size, size_t nmemb, void *userdata) {
   (void)ptr;
@@ -13,8 +13,7 @@ static size_t discard_response(char *ptr, size_t size, size_t nmemb, void *userd
   return size * nmemb;
 }
 
-int forgeops_client_deliver(const forgeops_configuration_t *config, const char *json_payload) {
-  char *url = forgeops_configuration_ingestion_url(config);
+static int post_json(const forgeops_configuration_t *config, char *url, const char *json_payload) {
   char *api_key = forgeops_configuration_api_key(config);
   if (url == NULL || api_key == NULL) {
     free(url);
@@ -42,7 +41,7 @@ int forgeops_client_deliver(const forgeops_configuration_t *config, const char *
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_payload));
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, config->timeout_seconds);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_response);
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); /* this client may run alongside its own signal handler installation -- don't let libcurl install/rely on its own SIGALRM-based timeout */
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); /* this client may run alongside its own signal handler installation: don't let libcurl install/rely on its own SIGALRM-based timeout */
 
   CURLcode result = curl_easy_perform(curl);
   int success = 0;
@@ -57,4 +56,24 @@ int forgeops_client_deliver(const forgeops_configuration_t *config, const char *
   free(url);
   free(api_key);
   return success;
+}
+
+int forgeops_client_deliver(const forgeops_configuration_t *config, const char *json_payload) {
+  return post_json(config, forgeops_configuration_ingestion_url(config), json_payload);
+}
+
+int forgeops_client_deliver_performance_samples(const forgeops_configuration_t *config, const char *json_payload) {
+  return post_json(config, forgeops_configuration_performance_samples_url(config), json_payload);
+}
+
+int forgeops_client_deliver_spans(const forgeops_configuration_t *config, const char *json_payload) {
+  return post_json(config, forgeops_configuration_spans_url(config), json_payload);
+}
+
+int forgeops_client_deliver_metrics(const forgeops_configuration_t *config, const char *json_payload) {
+  return post_json(config, forgeops_configuration_custom_metrics_url(config), json_payload);
+}
+
+int forgeops_client_deliver_infrastructure_metrics(const forgeops_configuration_t *config, const char *json_payload) {
+  return post_json(config, forgeops_configuration_infrastructure_metrics_url(config), json_payload);
 }

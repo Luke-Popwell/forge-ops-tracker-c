@@ -1,11 +1,11 @@
 /*
- * POSIX Extended Regular Expressions (<regex.h>) have no `\d`, `\s`, or `\b` -- unlike the PCRE
+ * POSIX Extended Regular Expressions (<regex.h>) have no `\d`, `\s`, or `\b`: unlike the PCRE
  * syntax every other client in this repo's own regex engine accepts unmodified from the Ruby
  * original. `\d`/`\s` are straightforward to translate (`[0-9]`/`[[:space:]]`); `\b` (word
  * boundary) has no POSIX equivalent at all, so the boundary-sensitive patterns below (JWT, AWS
  * key, Stripe key, GitHub token, bearer token, SSN) simply don't require one here. Verified
  * directly (see /tmp/regextest*.c during development, not committed) that this doesn't cause
- * false negatives against any of this file's own test inputs -- interval expressions
+ * false negatives against any of this file's own test inputs: interval expressions
  * ({n,m}) work fine on POSIX ERE, and every pattern below still requires its own literal
  * delimiters (a leading "AKIA", a "-" between SSN groups, and so on), so dropping `\b` only
  * risks a slightly wider match (redacting a token embedded inside a longer string that also
@@ -28,7 +28,7 @@ typedef struct {
 } pattern_spec_t;
 
 /* Every pattern here matches gems/forge_ops_tracker/lib/forge_ops_tracker/pii_scrubber.rb's own
- * 8 patterns as closely as POSIX ERE allows -- see this file's own top comment for the `\d`/`\s`/
+ * 8 patterns as closely as POSIX ERE allows: see this file's own top comment for the `\d`/`\s`/
  * `\b` adjustments that required. */
 static const pattern_spec_t PATTERNS[] = {
     {"EMAIL", "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}", 0},
@@ -45,7 +45,7 @@ static const size_t PATTERN_COUNT = sizeof(PATTERNS) / sizeof(PATTERNS[0]);
 static char *apply_pattern(const char *input, const pattern_spec_t *spec) {
   regex_t re;
   if (regcomp(&re, spec->pattern, REG_EXTENDED | spec->extra_flags) != 0) {
-    /* A pattern here failing to compile is a bug in this file, not something a caller did --
+    /* A pattern here failing to compile is a bug in this file, not something a caller did:
      * every pattern above is a fixed literal compiled once per call. Fall back to returning the
      * input unmodified rather than crashing the host app over a scrubber bug. */
     return strdup(input);
@@ -67,7 +67,7 @@ static char *apply_pattern(const char *input, const pattern_spec_t *spec) {
     forgeops_strbuf_append(&out, replacement, strlen(replacement));
 
     if (match.rm_eo == match.rm_so) {
-      /* Defensive only -- none of the patterns above can match an empty string, but an infinite
+      /* Defensive only: none of the patterns above can match an empty string, but an infinite
        * loop here would hang the host app, so guard it anyway. */
       if (cursor[match.rm_eo] == '\0') break;
       forgeops_strbuf_append(&out, cursor + match.rm_eo, 1);

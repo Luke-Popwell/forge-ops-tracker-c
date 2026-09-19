@@ -1,7 +1,7 @@
 #ifndef FORGEOPS_TRACKER_INTERNAL_STRBUF_H
 #define FORGEOPS_TRACKER_INTERNAL_STRBUF_H
 
-/* A tiny growable-buffer helper shared across this SDK's .c files (never installed -- an
+/* A tiny growable-buffer helper shared across this SDK's .c files (never installed: an
  * implementation detail, not part of the public API). Header-only/static so there's no separate
  * translation unit or build-system entry needed for something this small. */
 

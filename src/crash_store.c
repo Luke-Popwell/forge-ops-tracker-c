@@ -71,7 +71,7 @@ char **forgeops_crash_store_pending_paths(const forgeops_configuration_t *config
 
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
-    /* Both extensions -- ".json" is a full event payload written by forgeops_report_error;
+    /* Both extensions: ".json" is a full event payload written by forgeops_report_error;
      * ".txt" is a raw signal-crash report written by the signal handler (see its own comment for
      * why that path can't safely build JSON inline). forgeops_upload_pending_reports branches on
      * which one it's looking at. */
@@ -92,7 +92,7 @@ char **forgeops_crash_store_pending_paths(const forgeops_configuration_t *config
     return NULL;
   }
 
-  /* File names embed time(NULL) first, so a plain string sort is already a chronological sort --
+  /* File names embed time(NULL) first, so a plain string sort is already a chronological sort:
    * no need to stat() each file individually. */
   qsort(names, count, sizeof(char *), compare_strings);
 
