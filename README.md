@@ -1,6 +1,6 @@
 # forgeops_tracker (C)
 
-Plain C error/crash reporting client for a [ForgeOps](../../) instance. Requires a POSIX
+Plain C error/crash reporting client for [ForgeOps](https://getforgeops.net). Requires a POSIX
 platform (macOS, Linux): see "Platform" below. Targets C11.
 
 This is a crash reporter, not a web-framework middleware: plain C has no exceptions and no web
