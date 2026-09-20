@@ -11,7 +11,7 @@
  * Public entry point. Typical usage, as early as possible in main():
  *
  *     forgeops_configuration_t *config = forgeops_tracker_configuration();
- *     forgeops_configuration_set_dsn(config, "https://<api_key>@your-forgeops-host/api/v1/events");
+ *     forgeops_configuration_set_dsn(config, "https://<api_key>@getforgeops.net/api/v1/events");
  *     forgeops_tracker_install_handlers();
  *
  * There's no configure-block style API here the way the higher-level clients in this repo have:

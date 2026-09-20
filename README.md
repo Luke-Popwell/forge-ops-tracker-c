@@ -67,7 +67,7 @@ directly:
 #include <forgeops_tracker/forgeops_tracker.h>
 
 forgeops_configuration_t *config = forgeops_tracker_configuration();
-forgeops_configuration_set_dsn(config, "https://<api_key>@your-forgeops-host/api/v1/events");
+forgeops_configuration_set_dsn(config, "https://<api_key>@getforgeops.net/api/v1/events");
 config->environment = "production"; /* a plain field write is fine for anything except dsn, which
                                         needs forgeops_configuration_set_dsn to invalidate its own
                                         cached parsing */
