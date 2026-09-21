@@ -16,9 +16,13 @@ static int has_suffix(const char *s, const char *suffix) {
 }
 
 void forgeops_report_error(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count) {
+  forgeops_report_error_with_sql(config, exception_class, message, context_keys, context_values, context_count, user_keys, user_values, user_count, breadcrumb_json, breadcrumb_count, NULL);
+}
+
+void forgeops_report_error_with_sql(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count, const char *sql) {
   if (!forgeops_configuration_is_enabled(config)) return;
 
-  char *json = forgeops_build_event_json(config, exception_class, message, context_keys, context_values, context_count, user_keys, user_values, user_count, breadcrumb_json, breadcrumb_count);
+  char *json = forgeops_build_event_json_with_sql(config, exception_class, message, context_keys, context_values, context_count, user_keys, user_values, user_count, breadcrumb_json, breadcrumb_count, sql);
   if (json == NULL) return;
 
   forgeops_crash_store_write(config, json);

@@ -11,6 +11,7 @@ add_library(forgeops_tracker
     src/configuration.c
     src/pii_scrubber.c
     src/event_builder.c
+    src/sql_statement.c
     src/crash_store.c
     src/client.c
     src/signal_handler.c

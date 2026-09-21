@@ -36,6 +36,15 @@
 char *forgeops_build_event_json(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count);
 
 /*
+ * The same as forgeops_build_event_json, plus the raw SQL statement behind the error (NULL when
+ * there isn't one). The statement is masked here (see sql_statement.h) before anything is
+ * attached: with config->capture_sql_objects on, a top-level "sql_objects" object names the
+ * procedures/tables/views it touched; with config->capture_sql_statement on too, a top-level
+ * "sql_statement" carries the masked text. The raw statement is never written to the payload.
+ */
+char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count, const char *sql);
+
+/*
  * Reads up to 5 lines of source on either side of `line` (1-based) in `file`, at call time, and
  * returns it pre-encoded as a JSON object-fragment ready to append directly onto an in-progress
  * frame object: `,"context_line":"...","pre_context":[...],"post_context":[...]`. Any single

@@ -24,6 +24,7 @@
 #include <time.h>
 
 #include "forgeops_tracker/pii_scrubber.h"
+#include "forgeops_tracker/sql_statement.h"
 #include "strbuf.h"
 
 #define MAX_FRAMES 64
@@ -301,6 +302,10 @@ static void append_iso8601_now(forgeops_strbuf_t *out) {
 }
 
 char *forgeops_build_event_json(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count) {
+  return forgeops_build_event_json_with_sql(config, exception_class, message, context_keys, context_values, context_count, user_keys, user_values, user_count, breadcrumb_json, breadcrumb_count, NULL);
+}
+
+char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count, const char *sql) {
   forgeops_strbuf_t out;
   if (forgeops_strbuf_init(&out, 512) != 0) return NULL;
 
@@ -361,6 +366,30 @@ char *forgeops_build_event_json(const forgeops_configuration_t *config, const ch
       forgeops_strbuf_append_str(&out, breadcrumb_json[i]);
     }
     forgeops_strbuf_append(&out, "]", 1);
+  }
+
+  /* See sql_statement.h. The statement itself only goes out when capture_sql_statement is on; the
+   * extracted names go out on their own (capture_sql_objects) so an issue can still name the
+   * procedure or view involved. The masked statement is scrubbed like any other free text. */
+  if (sql != NULL && (config->capture_sql_objects || config->capture_sql_statement)) {
+    char *masked = forgeops_sql_mask(sql);
+    if (masked != NULL) {
+      if (config->capture_sql_objects) {
+        char *objects = forgeops_sql_objects_json(masked);
+        if (objects != NULL) {
+          forgeops_strbuf_append_str(&out, ",\"sql_objects\":");
+          forgeops_strbuf_append_str(&out, objects);
+          free(objects);
+        }
+      }
+      if (config->capture_sql_statement) {
+        char *scrubbed_statement = config->scrub_pii ? forgeops_scrub_string(masked) : NULL;
+        forgeops_strbuf_append_str(&out, ",\"sql_statement\":");
+        json_append_string_or_null(&out, scrubbed_statement != NULL ? scrubbed_statement : masked);
+        free(scrubbed_statement);
+      }
+      free(masked);
+    }
   }
   forgeops_strbuf_append(&out, "}", 1);
 

@@ -56,12 +56,16 @@ void forgeops_tracker_install_handlers(void) {
 }
 
 void forgeops_tracker_capture_error(const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count) {
+  forgeops_tracker_capture_error_with_sql(exception_class, message, NULL, context_keys, context_values, context_count, user_keys, user_values, user_count);
+}
+
+void forgeops_tracker_capture_error_with_sql(const char *exception_class, const char *message, const char *sql, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count) {
   if (user_count == 0) {
     forgeops_tracker_current_user(&user_keys, &user_values, &user_count);
   }
   size_t breadcrumb_count = 0;
   char **breadcrumbs = forgeops_breadcrumbs_snapshot(&breadcrumb_count);
-  forgeops_report_error(forgeops_tracker_configuration(), exception_class, message, context_keys, context_values, context_count, user_keys, user_values, user_count, (const char **)breadcrumbs, breadcrumb_count);
+  forgeops_report_error_with_sql(forgeops_tracker_configuration(), exception_class, message, context_keys, context_values, context_count, user_keys, user_values, user_count, (const char **)breadcrumbs, breadcrumb_count, sql);
   forgeops_breadcrumbs_free_snapshot(breadcrumbs, breadcrumb_count);
 }
 

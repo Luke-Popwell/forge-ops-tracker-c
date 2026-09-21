@@ -24,6 +24,10 @@
  * straight through the same way. */
 void forgeops_report_error(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count);
 
+/* The same as forgeops_report_error, plus the raw SQL statement behind the error (NULL when there
+ * isn't one): see forgeops_build_event_json_with_sql. */
+void forgeops_report_error_with_sql(const forgeops_configuration_t *config, const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count, const char **breadcrumb_json, size_t breadcrumb_count, const char *sql);
+
 /*
  * Uploads every pending report left over from a previous call (or previous process launch),
  * deleting each on success and leaving a failed one in place for the next attempt. Synchronous:

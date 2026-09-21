@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.1.0
+  GIT_TAG v0.3.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -358,6 +358,31 @@ never scrubbed, since redacting it would defeat the whole point of identifying u
 place.
 
 To disable it: `config->scrub_pii = 0;`
+
+## Database errors
+
+C has no exception type that could carry the SQL, so the code that ran the query hands it over. Report the failure with `forgeops_tracker_capture_error_with_sql` and the event includes the names of the stored procedure, table and view that SQL touched, so the issue tells you where to start looking. Names are identifiers, never values; the raw statement never leaves the process.
+
+To also send the SQL statement itself, opt in. Every string and number is replaced by `?` before it
+leaves your process (`WHERE email = 'a@b.co' AND id = 42` is sent as `WHERE email = ? AND id = ?`),
+and ForgeOps masks it again on arrival:
+
+```c
+const char *sql = "SELECT * FROM orders WHERE id = 42";
+if (run_query(db, sql) != 0) {
+    forgeops_tracker_capture_error_with_sql("DatabaseError", "query failed", sql,
+                                            NULL, NULL, 0, NULL, NULL, 0);
+}
+
+// Opt in to also sending the masked statement (default 0). capture_sql_objects (default 1)
+// controls the names.
+forgeops_tracker_configuration()->capture_sql_statement = 1;
+```
+
+Each ForgeOps project also has its own "Capture the SQL behind database errors" setting. Turn it off
+there and the statement is never stored for that project, whatever this flag says; the names are
+still kept. A view and a table are written the same way in SQL, so both show as tables/views; the
+database's own error message usually settles which it was.
 
 ## Running the tests
 

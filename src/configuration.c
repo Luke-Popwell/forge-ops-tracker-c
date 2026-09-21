@@ -46,6 +46,8 @@ forgeops_configuration_t *forgeops_configuration_create(void) {
 
   config->scrub_pii = 1;
   config->capture_source_context = 1;
+  config->capture_sql_objects = 1;
+  config->capture_sql_statement = 0;
   config->track_breadcrumbs = 1;
   config->track_performance = 1;
   config->performance_flush_interval_seconds = 60;

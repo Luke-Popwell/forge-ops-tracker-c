@@ -46,6 +46,18 @@ void forgeops_tracker_install_handlers(void);
 void forgeops_tracker_capture_error(const char *exception_class, const char *message, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count);
 
 /*
+ * The same as forgeops_tracker_capture_error, for an error caused by a database call: pass the
+ * SQL that ran. C has no exception type that could carry it, and no C database library puts it
+ * anywhere this SDK could find, so the code that ran the query hands it over.
+ *
+ * With capture_sql_objects on (the default), the names of the stored procedure, table and view the
+ * statement touched are sent, so an issue says where to start looking. With capture_sql_statement
+ * on too (off by default), the statement itself is sent as well, with every string and number
+ * replaced by "?" first. The raw statement never leaves this process either way.
+ */
+void forgeops_tracker_capture_error_with_sql(const char *exception_class, const char *message, const char *sql, const char **context_keys, const char **context_values, size_t context_count, const char **user_keys, const char **user_values, size_t user_count);
+
+/*
  * Manually attaches an affected user to whatever gets reported from here on, *on this thread* (an
  * explicit forgeops_tracker_capture_error call with user_count 0, or a fatal signal, filled in at
  * upload time): there's no way to automatically detect "the current user" in plain C, so call

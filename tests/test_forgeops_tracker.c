@@ -1935,7 +1935,125 @@ TEST(metrics_a_program_that_captures_a_reading_and_just_exits_still_delivers_it_
   remove(body_path);
 }
 
+
+/* ---- SQL capture ---------------------------------------------------------------------------- */
+
+#include "forgeops_tracker/sql_statement.h"
+
+static void assert_masks_to(const char *input, const char *expected) {
+  char *masked = forgeops_sql_mask(input);
+  if (masked == NULL || strcmp(masked, expected) != 0) {
+    printf("  mask(%s) = %s, expected %s\n", input, masked == NULL ? "(null)" : masked, expected);
+    g_current_test_failed = 1;
+  }
+  free(masked);
+}
+
+static void assert_objects_are(const char *masked, const char *expected_json) {
+  char *json = forgeops_sql_objects_json(masked);
+  if (expected_json == NULL) {
+    if (json != NULL) {
+      printf("  objects(%s) = %s, expected NULL\n", masked, json);
+      g_current_test_failed = 1;
+    }
+  } else if (json == NULL || strcmp(json, expected_json) != 0) {
+    printf("  objects(%s) = %s, expected %s\n", masked, json == NULL ? "(null)" : json, expected_json);
+    g_current_test_failed = 1;
+  }
+  free(json);
+}
+
+TEST(sql_mask_replaces_strings_and_numbers_but_not_identifiers_or_placeholders) {
+  assert_masks_to("SELECT * FROM orders2 WHERE email = 'a@b.co' AND id = 42 AND x = $1", "SELECT * FROM orders2 WHERE email = ? AND id = ? AND x = $1");
+  assert_masks_to("SELECT price * 1.5 FROM t WHERE a IN (1,2,3)", "SELECT price * ? FROM t WHERE a IN (?,?,?)");
+  assert_masks_to("SELECT 1.5x FROM t", "SELECT ?.5x FROM t");
+}
+
+TEST(sql_mask_handles_an_escaped_quote_a_cut_off_string_and_a_dollar_quoted_body) {
+  assert_masks_to("EXEC sp_x @t = 'it''s'", "EXEC sp_x @t = ?");
+  assert_masks_to("SELECT 1 WHERE n = 'oops", "SELECT ? WHERE n = ?");
+  assert_masks_to("DO $b$ BEGIN PERFORM 1; END $b$", "DO ?");
+}
+
+TEST(sql_mask_is_idempotent_truncates_and_returns_null_for_blank) {
+  char *once = forgeops_sql_mask("SELECT * FROM t WHERE a = 'x' AND b = 9");
+  ASSERT_NOT_NULL(once);
+  char *twice = forgeops_sql_mask(once);
+  ASSERT_TRUE(twice != NULL && strcmp(once, twice) == 0);
+  free(once);
+  free(twice);
+
+  size_t n = 3000;
+  char *long_sql = malloc(n * 3 + 16);
+  strcpy(long_sql, "SELECT ");
+  for (size_t i = 0; i < n; i++) strcat(long_sql, "a, ");
+  strcat(long_sql, " b");
+  char *masked = forgeops_sql_mask(long_sql);
+  ASSERT_TRUE(masked != NULL && strlen(masked) == 4003);
+  free(masked);
+  free(long_sql);
+
+  ASSERT_TRUE(forgeops_sql_mask("  ") == NULL);
+  ASSERT_TRUE(forgeops_sql_mask(NULL) == NULL);
+}
+
+TEST(sql_objects_finds_a_stored_procedure_with_its_schema) {
+  assert_objects_are("EXEC dbo.sp_refund_order @id = ?", "{\"operation\":\"EXEC\",\"procedures\":[\"dbo.sp_refund_order\"],\"relations\":[]}");
+  assert_objects_are("CALL refund_order(?, ?)", "{\"operation\":\"CALL\",\"procedures\":[\"refund_order\"],\"relations\":[]}");
+  assert_objects_are("SELECT refund_order(?, ?)", "{\"operation\":\"SELECT\",\"procedures\":[\"refund_order\"],\"relations\":[]}");
+}
+
+TEST(sql_objects_finds_views_joined_tables_and_table_functions) {
+  assert_objects_are("SELECT * FROM v_totals t JOIN public.customers c ON c.id = t.id", "{\"operation\":\"SELECT\",\"procedures\":[],\"relations\":[\"v_totals\",\"public.customers\"]}");
+  assert_objects_are("SELECT * FROM get_open_orders(?) o", "{\"operation\":\"SELECT\",\"procedures\":[\"get_open_orders\"],\"relations\":[]}");
+  assert_objects_are("UPDATE \"Order Items\" SET qty = ?", "{\"operation\":\"UPDATE\",\"procedures\":[],\"relations\":[\"\\\"Order Items\\\"\"]}");
+}
+
+TEST(sql_objects_does_not_misread_column_lists_builtins_or_from_inside_extract) {
+  assert_objects_are("INSERT INTO audit_log (a) VALUES (?)", "{\"operation\":\"INSERT\",\"procedures\":[],\"relations\":[\"audit_log\"]}");
+  assert_objects_are("SELECT count(*) FROM orders", "{\"operation\":\"SELECT\",\"procedures\":[],\"relations\":[\"orders\"]}");
+  assert_objects_are("SELECT 1 FROM orders WHERE extract(year FROM created_at) = ?", "{\"operation\":\"SELECT\",\"procedures\":[],\"relations\":[\"orders\"]}");
+  assert_objects_are("garbage", NULL);
+}
+
+TEST(sql_event_builder_sends_the_procedure_name_by_default_and_the_statement_only_when_opted_in) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  const char *sql = "EXEC dbo.sp_refund_order @order_id = 8814, @note = 'a@b.co'";
+
+  char *json = forgeops_build_event_json_with_sql(config, "MyError", "boom", NULL, NULL, 0, NULL, NULL, 0, NULL, 0, sql);
+  ASSERT_NOT_NULL(json);
+  ASSERT_TRUE(strstr(json, "\"sql_objects\":{\"operation\":\"EXEC\",\"procedures\":[\"dbo.sp_refund_order\"]") != NULL);
+  ASSERT_TRUE(strstr(json, "sql_statement") == NULL);
+  ASSERT_TRUE(strstr(json, "8814") == NULL && strstr(json, "a@b.co") == NULL);
+  free(json);
+
+  config->capture_sql_statement = 1;
+  json = forgeops_build_event_json_with_sql(config, "MyError", "boom", NULL, NULL, 0, NULL, NULL, 0, NULL, 0, sql);
+  ASSERT_TRUE(strstr(json, "\"sql_statement\":\"EXEC dbo.sp_refund_order @order_id = ?, @note = ?\"") != NULL);
+  free(json);
+
+  config->capture_sql_objects = 0;
+  config->capture_sql_statement = 0;
+  json = forgeops_build_event_json_with_sql(config, "MyError", "boom", NULL, NULL, 0, NULL, NULL, 0, NULL, 0, sql);
+  ASSERT_TRUE(strstr(json, "\"sql_objects\"") == NULL && strstr(json, "\"sql_statement\"") == NULL);
+  free(json);
+
+  config->capture_sql_objects = 1;
+  json = forgeops_build_event_json_with_sql(config, "MyError", "boom", NULL, NULL, 0, NULL, NULL, 0, NULL, 0, NULL);
+  ASSERT_TRUE(strstr(json, "\"sql_objects\"") == NULL && strstr(json, "\"sql_statement\"") == NULL);
+  free(json);
+
+  forgeops_configuration_destroy(config);
+}
+
 int main(void) {
+  RUN(sql_mask_replaces_strings_and_numbers_but_not_identifiers_or_placeholders);
+  RUN(sql_mask_handles_an_escaped_quote_a_cut_off_string_and_a_dollar_quoted_body);
+  RUN(sql_mask_is_idempotent_truncates_and_returns_null_for_blank);
+  RUN(sql_objects_finds_a_stored_procedure_with_its_schema);
+  RUN(sql_objects_finds_views_joined_tables_and_table_functions);
+  RUN(sql_objects_does_not_misread_column_lists_builtins_or_from_inside_extract);
+  RUN(sql_event_builder_sends_the_procedure_name_by_default_and_the_statement_only_when_opted_in);
   RUN(configuration_defaults);
   RUN(configuration_api_key_and_ingestion_url);
   RUN(configuration_api_key_percent_decodes);

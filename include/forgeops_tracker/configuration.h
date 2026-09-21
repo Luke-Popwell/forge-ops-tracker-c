@@ -34,6 +34,18 @@ typedef struct {
    */
   int capture_source_context;
   /*
+   * When an error is reported with the SQL behind a failed database call (see
+   * forgeops_tracker_capture_error_with_sql), send the names of the stored procedure, table and
+   * view that SQL touched, so an issue says where to start looking. Names are identifiers, never
+   * values, which is why this defaults on (1). capture_sql_statement is the separate, opt-in step
+   * (default 0) of also sending the statement itself, with every string and number replaced by
+   * "?"; off by default because even a masked statement describes your schema, and ForgeOps' own
+   * per-project setting is what durably governs whether the server stores it. See
+   * sql_statement.h.
+   */
+  int capture_sql_objects;
+  int capture_sql_statement;
+  /*
    * Whether forgeops_tracker_add_breadcrumb records anything at all. Boolean: 1 = on (the
    * default), 0 = off, matching every other client in this repo.
    */
