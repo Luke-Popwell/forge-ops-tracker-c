@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "forgeops_tracker/configuration.h"
+#include "forgeops_tracker/trace_parent.h"
 
 /*
  * One thread's trace: a tree of timed spans (a request's or job's own call tree) that is sent to
@@ -17,6 +18,13 @@
  * most FORGEOPS_SPANS_MAX_SPANS spans including the root. Kinds are the closed set the ingestion API
  * accepts (controller, service, database, redis, http, job, other): anything else is sent as
  * "other", since one bad kind would make the server reject the whole trace.
+ *
+ * A trace exists whenever reporting is enabled, even with track_tracing off: its id still goes on
+ * errors captured inside it and on the traceparent header an http span hands out, since that id is
+ * what links an error here to one in another service. Only sending the spans is gated. When the
+ * trace continues another service's (see trace_parent.h), it keeps that trace id and its root span
+ * points at the caller's span, which the server nests it under even though it arrives in a different
+ * upload.
  *
  * A finished trace is handed to a background delivery thread through a bounded queue, the same
  * shape as the performance flusher's thread: one joinable pthread started lazily on the first
@@ -38,13 +46,27 @@ typedef struct {
 } forgeops_span_state_t;
 
 /*
- * Starts a trace on the calling thread. Returns 1 if this call started it (the caller owns the root
- * and should end it), 0 if a trace is already open here, or if tracing is off or reporting isn't
- * enabled (nothing is recorded then, but every later call still works as a harmless no-op).
+ * Starts a trace on the calling thread, continuing traceparent when it is a usable W3C header value
+ * and starting a fresh trace id otherwise (NULL included). Returns 1 if this call started it (the
+ * caller owns the root and should end it), 0 if a trace is already open here (traceparent is then
+ * ignored), or if reporting isn't enabled (nothing is recorded then, but every later call still works
+ * as a harmless no-op). With track_tracing off a trace still starts, for its id, but is never sent.
  */
-int forgeops_spans_trace_begin(const forgeops_configuration_t *config);
+int forgeops_spans_trace_begin(const forgeops_configuration_t *config, const char *traceparent);
 
-/* Ends the calling thread's trace, always clearing it, and queues it when the root took long enough. */
+/* The calling thread's open trace id (32 lowercase hex characters), or NULL outside a trace. Points
+ * into the trace itself: valid until that trace ends. */
+const char *forgeops_spans_current_trace_id(void);
+
+/*
+ * Writes "#trace_id <id>\n" to fd when the calling thread has an open trace, nothing otherwise.
+ * Async-signal-safe: only write(), never allocating. Called from the fatal-signal handler, so a crash
+ * inside a trace carries its id (see forgeops_signal_handler_complete_json).
+ */
+void forgeops_spans_write_raw_trace_id_to_fd(int fd);
+
+/* Ends the calling thread's trace, always clearing it, and queues it when the root took long enough
+ * and track_tracing was on when it began. */
 void forgeops_spans_trace_end(const forgeops_configuration_t *config, const char *root_name, long long started_at_unix_ms, double duration_ms);
 
 /* Opens a span under whatever is open (or the root); state->active is 0 outside a trace. */

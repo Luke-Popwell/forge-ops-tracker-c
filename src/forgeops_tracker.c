@@ -1,5 +1,6 @@
 #include "forgeops_tracker/forgeops_tracker.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,9 +133,17 @@ static long long wall_clock_ms(void) {
 }
 
 forgeops_trace_t forgeops_tracker_trace_start(void) {
+  return forgeops_tracker_trace_start_with_traceparent(NULL);
+}
+
+forgeops_trace_t forgeops_tracker_trace_start_with_traceparent(const char *traceparent) {
   forgeops_trace_t trace = {wall_clock_ms(), monotonic_now_ns(), 0};
-  trace.owns = forgeops_spans_trace_begin(forgeops_tracker_configuration());
+  trace.owns = forgeops_spans_trace_begin(forgeops_tracker_configuration(), traceparent);
   return trace;
+}
+
+const char *forgeops_tracker_current_trace_id(void) {
+  return forgeops_spans_current_trace_id();
 }
 
 void forgeops_tracker_trace_stop(forgeops_trace_t *trace, const char *root_name) {
@@ -162,6 +171,42 @@ void forgeops_tracker_span_stop_with_data(forgeops_span_t *span, const char **da
 
 void forgeops_tracker_span_stop(forgeops_span_t *span) {
   forgeops_tracker_span_stop_with_data(span, NULL, NULL, 0);
+}
+
+forgeops_http_span_t forgeops_tracker_http_span_start(const char *method, const char *url) {
+  forgeops_http_span_t span;
+  memset(&span, 0, sizeof(span));
+
+  char host[256];
+  int has_host = forgeops_url_host(url, host, sizeof(host));
+  size_t n = 0;
+  for (const char *m = method != NULL ? method : "GET"; *m != '\0' && n + 1 < sizeof(span.name); m++) {
+    span.name[n++] = (char)toupper((unsigned char)*m);
+  }
+  snprintf(span.name + n, sizeof(span.name) - n, " %s", has_host ? host : "unknown");
+
+  /* The span id exists before the call is made, which is what lets the header name the span the
+   * call is then recorded as. */
+  forgeops_spans_start(&span.state);
+  span.state.started_at_unix_ms = wall_clock_ms();
+  span.state.started_at_ns = monotonic_now_ns();
+
+  const char *trace_id = forgeops_spans_current_trace_id();
+  if (span.state.active && trace_id != NULL && forgeops_configuration_should_propagate_trace(forgeops_tracker_configuration(), has_host ? host : NULL)) {
+    forgeops_traceparent_build(trace_id, span.state.id, span.traceparent);
+    snprintf(span.header, sizeof(span.header), FORGEOPS_TRACEPARENT_HEADER ": %s", span.traceparent);
+  }
+  return span;
+}
+
+void forgeops_tracker_http_span_stop_with_data(forgeops_http_span_t *span, const char **data_keys, const char **data_values, size_t data_count) {
+  if (span == NULL || !span->state.active) return;
+  double duration_ms = (double)(monotonic_now_ns() - span->state.started_at_ns) / 1e6;
+  forgeops_spans_stop(forgeops_tracker_configuration(), &span->state, span->name, "http", duration_ms, data_keys, data_values, data_count);
+}
+
+void forgeops_tracker_http_span_stop(forgeops_http_span_t *span) {
+  forgeops_tracker_http_span_stop_with_data(span, NULL, NULL, 0);
 }
 
 void forgeops_tracker_record_span(const char *name, const char *kind, long long started_at_unix_ms, double duration_ms, const char **data_keys, const char **data_values, size_t data_count) {

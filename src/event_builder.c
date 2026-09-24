@@ -24,6 +24,7 @@
 #include <time.h>
 
 #include "forgeops_tracker/pii_scrubber.h"
+#include "forgeops_tracker/spans.h"
 #include "forgeops_tracker/sql_statement.h"
 #include "strbuf.h"
 
@@ -390,6 +391,15 @@ char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config,
       }
       free(masked);
     }
+  }
+
+  /* The id of the trace open on the reporting thread (see spans.h), linking this error to that
+   * trace's spans and, through traceparent, to errors in the other services it touched. A structured
+   * id, never scrubbed; omitted entirely outside a trace. */
+  const char *trace_id = forgeops_spans_current_trace_id();
+  if (trace_id != NULL) {
+    forgeops_strbuf_append_str(&out, ",\"trace_id\":");
+    json_append_escaped_string(&out, trace_id);
   }
   forgeops_strbuf_append(&out, "}", 1);
 

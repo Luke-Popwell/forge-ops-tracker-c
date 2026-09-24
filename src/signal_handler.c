@@ -13,6 +13,7 @@
 
 #include "forgeops_tracker/breadcrumbs.h"
 #include "forgeops_tracker/forgeops_tracker.h"
+#include "forgeops_tracker/spans.h"
 #include "strbuf.h"
 
 static const int FATAL_SIGNALS[] = {SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGTRAP};
@@ -49,6 +50,10 @@ void forgeops_signal_handler_write_report(int signal_number) {
      * write() and strlen() inside, no allocation. Last, after the backtrace, so a problem here can
      * never cost the backtrace itself. */
     forgeops_breadcrumbs_write_raw_to_fd(fd);
+
+    /* The id of the trace this thread had open, if any (see spans.h): the same plain-reads-and-write()
+     * shape as the trail above. */
+    forgeops_spans_write_raw_trace_id_to_fd(fd);
 
     close(fd);
   }
@@ -150,10 +155,22 @@ char *forgeops_signal_handler_complete_json(const forgeops_configuration_t *conf
   forgeops_strbuf_t crumbs;
   int have_crumbs = forgeops_strbuf_init(&crumbs, 256) == 0;
   size_t crumb_count = 0;
+  char trace_id[FORGEOPS_TRACE_ID_LENGTH + 1] = {0};
   while (fgets(line, sizeof(line), f) != NULL) {
     size_t len = strlen(line);
     if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
     if (len == 0) continue;
+
+    if (strncmp(line, "#trace_id ", 10) == 0) {
+      /* Only a whole, well-formed id: anything else (a cut-off write, corruption) is dropped. */
+      const char *id = line + 10;
+      int valid = len == 10 + FORGEOPS_TRACE_ID_LENGTH;
+      for (size_t i = 0; valid && i < FORGEOPS_TRACE_ID_LENGTH; i++) {
+        valid = (id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f');
+      }
+      if (valid) memcpy(trace_id, id, FORGEOPS_TRACE_ID_LENGTH);
+      continue;
+    }
 
     if (strncmp(line, "#breadcrumb ", 12) == 0) {
       /* A line the process died in the middle of writing (or any corruption) would break the whole
@@ -220,6 +237,12 @@ char *forgeops_signal_handler_complete_json(const forgeops_configuration_t *conf
     forgeops_strbuf_append(&out, "]", 1);
   }
   if (have_crumbs) free(crumbs.data);
+  /* Written by the handler itself, like the trail: the trace the crashing thread had open. */
+  if (trace_id[0] != '\0') {
+    forgeops_strbuf_append_str(&out, ",\"trace_id\":\"");
+    forgeops_strbuf_append_str(&out, trace_id);
+    forgeops_strbuf_append(&out, "\"", 1);
+  }
   forgeops_strbuf_append(&out, "}", 1);
 
   return out.data;

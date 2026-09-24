@@ -5,13 +5,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "forgeops_tracker/client.h"
 #include "strbuf.h"
 
 typedef struct {
-  char trace_id[33];
+  char trace_id[FORGEOPS_TRACE_ID_LENGTH + 1];
   char root_span_id[FORGEOPS_SPAN_ID_LENGTH + 1];
+  char remote_parent_span_id[FORGEOPS_SPAN_ID_LENGTH + 1]; /* "" unless continuing another service's trace */
+  int send; /* track_tracing as it was when the trace began: whether trace_end sends the spans at all */
   forgeops_strbuf_t spans; /* finished spans, each one JSON object, comma-separated */
   int span_count;
   char open[FORGEOPS_SPANS_MAX_DEPTH][FORGEOPS_SPAN_ID_LENGTH + 1];
@@ -40,24 +43,6 @@ static const char *normalize_kind(const char *kind) {
     }
   }
   return "other";
-}
-
-static void random_hex(char *out, size_t hex_length) {
-  size_t bytes = hex_length / 2;
-  unsigned char raw[16];
-  int filled = 0;
-  FILE *urandom = fopen("/dev/urandom", "rb");
-  if (urandom != NULL) {
-    filled = fread(raw, 1, bytes, urandom) == bytes;
-    fclose(urandom);
-  }
-  if (!filled) {
-    /* No /dev/urandom: an id only has to be unique within one project's traces, not unpredictable. */
-    static unsigned int seed = 0;
-    if (seed == 0) seed = (unsigned int)time(NULL) ^ (unsigned int)(size_t)&seed;
-    for (size_t i = 0; i < bytes; i++) raw[i] = (unsigned char)(rand_r(&seed) & 0xff);
-  }
-  for (size_t i = 0; i < bytes; i++) snprintf(out + i * 2, 3, "%02x", raw[i]);
 }
 
 static void append_json_string(forgeops_strbuf_t *out, const char *value) {
@@ -147,9 +132,9 @@ static void free_trace(trace_t *trace) {
   free(trace);
 }
 
-int forgeops_spans_trace_begin(const forgeops_configuration_t *config) {
+int forgeops_spans_trace_begin(const forgeops_configuration_t *config, const char *traceparent) {
   if (config == NULL || current_trace != NULL) return 0;
-  if (!config->track_tracing || !forgeops_configuration_is_enabled(config)) return 0;
+  if (!forgeops_configuration_is_enabled(config)) return 0;
 
   trace_t *trace = calloc(1, sizeof(trace_t));
   if (trace == NULL) return 0;
@@ -157,10 +142,26 @@ int forgeops_spans_trace_begin(const forgeops_configuration_t *config) {
     free(trace);
     return 0;
   }
-  random_hex(trace->trace_id, 32);
-  random_hex(trace->root_span_id, FORGEOPS_SPAN_ID_LENGTH);
+  if (!forgeops_traceparent_parse(traceparent, trace->trace_id, trace->remote_parent_span_id)) {
+    forgeops_trace_random_id(trace->trace_id, FORGEOPS_TRACE_ID_LENGTH);
+    trace->remote_parent_span_id[0] = '\0';
+  }
+  forgeops_trace_random_id(trace->root_span_id, FORGEOPS_SPAN_ID_LENGTH);
+  trace->send = config->track_tracing;
   current_trace = trace;
   return 1;
+}
+
+const char *forgeops_spans_current_trace_id(void) {
+  return current_trace != NULL ? current_trace->trace_id : NULL;
+}
+
+void forgeops_spans_write_raw_trace_id_to_fd(int fd) {
+  const trace_t *trace = current_trace;
+  if (trace == NULL) return;
+  (void)!write(fd, "#trace_id ", 10);
+  (void)!write(fd, trace->trace_id, FORGEOPS_TRACE_ID_LENGTH);
+  (void)!write(fd, "\n", 1);
 }
 
 static void worker_deliver_loop(void) {
@@ -227,13 +228,13 @@ void forgeops_spans_trace_end(const forgeops_configuration_t *config, const char
     return;
   }
 
-  if (duration_ms >= (double)config->trace_capture_threshold_ms) {
+  if (trace->send && duration_ms >= (double)config->trace_capture_threshold_ms) {
     forgeops_strbuf_t body;
     if (forgeops_strbuf_init(&body, trace->spans.length + 512) == 0) {
       forgeops_strbuf_append_str(&body, "{\"trace_id\":\"");
       forgeops_strbuf_append_str(&body, trace->trace_id);
       forgeops_strbuf_append_str(&body, "\",\"spans\":[");
-      append_span(&body, config, trace->root_span_id, NULL, root_name != NULL ? root_name : "trace", "controller", started_at_unix_ms, duration_ms, NULL, NULL, 0);
+      append_span(&body, config, trace->root_span_id, trace->remote_parent_span_id[0] != '\0' ? trace->remote_parent_span_id : NULL, root_name != NULL ? root_name : "trace", "controller", started_at_unix_ms, duration_ms, NULL, NULL, 0);
       if (trace->span_count > 0) {
         forgeops_strbuf_append(&body, ",", 1);
         forgeops_strbuf_append(&body, trace->spans.data, trace->spans.length);
@@ -250,7 +251,7 @@ void forgeops_spans_start(forgeops_span_state_t *state) {
   trace_t *trace = current_trace;
   if (trace == NULL) return;
 
-  random_hex(state->id, FORGEOPS_SPAN_ID_LENGTH);
+  forgeops_trace_random_id(state->id, FORGEOPS_SPAN_ID_LENGTH);
   snprintf(state->parent, sizeof(state->parent), "%s", current_parent(trace));
   if (trace->open_count < FORGEOPS_SPANS_MAX_DEPTH) {
     memcpy(trace->open[trace->open_count++], state->id, sizeof(state->id));
@@ -280,7 +281,7 @@ void forgeops_spans_record(const forgeops_configuration_t *config, const char *n
   if (trace == NULL || config == NULL) return;
 
   char id[FORGEOPS_SPAN_ID_LENGTH + 1];
-  random_hex(id, FORGEOPS_SPAN_ID_LENGTH);
+  forgeops_trace_random_id(id, FORGEOPS_SPAN_ID_LENGTH);
   record(trace, config, id, current_parent(trace), name, kind, started_at_unix_ms, duration_ms, data_keys, data_values, data_count);
 }
 

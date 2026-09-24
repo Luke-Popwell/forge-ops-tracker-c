@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 static char *dup_or_null(const char *s) {
@@ -56,6 +57,9 @@ forgeops_configuration_t *forgeops_configuration_create(void) {
   config->metric_flush_interval_seconds = 60;
   config->infrastructure_metric_flush_interval_seconds = 60;
   config->max_breadcrumbs = 30;
+  config->propagate_traces = 1;
+  config->trace_propagation_targets = NULL; /* every host */
+  config->trace_propagation_target_count = 0;
   config->timeout_seconds = 5; /* longer than the request-based clients' ~2s: see the Objective-C/Swift clients' own identical reasoning: this fires on the *next* launch after a crash, not inline with a live request */
 
   config->enabled_environment_count = 2;
@@ -79,7 +83,49 @@ void forgeops_configuration_destroy(forgeops_configuration_t *config) {
     free(config->enabled_environments[i]);
   }
   free(config->enabled_environments);
+  forgeops_configuration_set_trace_propagation_targets(config, NULL, 0);
   free(config);
+}
+
+void forgeops_configuration_set_trace_propagation_targets(forgeops_configuration_t *config, const char **hosts, size_t count) {
+  if (config == NULL) return;
+  for (int i = 0; i < config->trace_propagation_target_count; i++) {
+    free(config->trace_propagation_targets[i]);
+  }
+  free(config->trace_propagation_targets);
+  config->trace_propagation_targets = NULL;
+  config->trace_propagation_target_count = 0;
+  if (hosts == NULL) return;
+
+  /* Allocated even for count 0: a non-NULL empty list is what means "no host". */
+  config->trace_propagation_targets = calloc(count > 0 ? count : 1, sizeof(char *));
+  if (config->trace_propagation_targets == NULL) return;
+  for (size_t i = 0; i < count; i++) {
+    config->trace_propagation_targets[i] = dup_or_null(hosts[i]);
+  }
+  config->trace_propagation_target_count = (int)count;
+}
+
+/* host equals target, or ends with "." + target: a dot boundary, so "example.com" never matches
+ * "badexample.com". Case-insensitive, since hostnames are; a leading dot on target is ignored. */
+static int host_matches_target(const char *host, const char *target) {
+  if (target == NULL) return 0;
+  if (*target == '.') target++;
+  size_t target_length = strlen(target);
+  size_t host_length = strlen(host);
+  if (target_length == 0 || host_length < target_length) return 0;
+  if (host_length == target_length) return strcasecmp(host, target) == 0;
+  return host[host_length - target_length - 1] == '.' && strcasecmp(host + host_length - target_length, target) == 0;
+}
+
+int forgeops_configuration_should_propagate_trace(const forgeops_configuration_t *config, const char *host) {
+  if (config == NULL || !config->propagate_traces) return 0;
+  if (config->trace_propagation_targets == NULL) return 1;
+  if (host == NULL || host[0] == '\0') return 0;
+  for (int i = 0; i < config->trace_propagation_target_count; i++) {
+    if (host_matches_target(host, config->trace_propagation_targets[i])) return 1;
+  }
+  return 0;
 }
 
 void forgeops_configuration_set_dsn(forgeops_configuration_t *config, const char *dsn) {

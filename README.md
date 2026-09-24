@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.3.0
+  GIT_TAG v0.4.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -213,7 +213,8 @@ A slow call's own breakdown: which database calls, HTTP calls, or pieces of your
 to, shown as a span tree on ForgeOps. Bracket the unit of work with `trace_start`/`trace_stop`, and
 anything inside it, on the same thread, can add spans; the trace is sent only when the whole thing
 took at least `trace_capture_threshold_ms` (1000 by default), so fast calls cost nothing on the
-wire. Traces are per service; nothing is propagated across services.
+wire. A trace can also be followed into the services you call and continued from the service that
+called you (see "Following a request across services" below).
 
 ```c
 forgeops_trace_t trace = forgeops_tracker_trace_start();
@@ -242,7 +243,74 @@ thread that called `trace_start`. A trace holds at most 500 spans.
 Like the performance flusher, delivery runs on one background pthread (started on the first finished
 slow trace) fed by a bounded queue (a full queue drops the trace rather than blocking the caller),
 plus an `atexit` hook that drains what is left on a normal exit; a process that exits some other way
-loses it. Turn the feature off with `config->track_tracing = 0`.
+loses it. Turn span reporting off with `config->track_tracing = 0`.
+
+### Following a request across services
+
+Traces use the [W3C Trace Context](https://www.w3.org/TR/trace-context/) standard (a `traceparent`
+header), so an error or a slow call can be followed from one service into the next.
+
+**Outgoing**: bracket each HTTP call you make inside a trace with `forgeops_tracker_http_span_start`/
+`forgeops_tracker_http_span_stop`. It records the call as an `http` span named after the method and
+host (never the path or query) and hands back the header to send; the header's parent id is that
+span's own id, so the called service's spans nest under it. `traceparent` is the bare value and
+`header` the whole `traceparent: <value>` line, ready for libcurl:
+
+```c
+forgeops_http_span_t http = forgeops_tracker_http_span_start("POST", url);
+struct curl_slist *headers = NULL;
+if (http.header[0] != '\0') headers = curl_slist_append(headers, http.header);
+curl_easy_setopt(curl, CURLOPT_URL, url);
+curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+CURLcode result = curl_easy_perform(curl);
+forgeops_tracker_http_span_stop(&http);
+curl_slist_free_all(headers);
+```
+
+Both strings are empty outside a trace (where nothing is recorded either), with
+`config->propagate_traces = 0`, or when the URL's host isn't in the propagation targets below. This
+client doesn't instrument libcurl or any other HTTP client itself, so a call made without an http
+span carries no header. The struct holds its own copies of everything, so it can be copied or
+returned freely.
+
+**Incoming**: pass the request's own `traceparent` header to
+`forgeops_tracker_trace_start_with_traceparent` and it continues the caller's trace (same trace id,
+root span parented under the caller's span). `NULL` or a malformed value just starts a new trace,
+exactly like `forgeops_tracker_trace_start`:
+
+```c
+/* However your server exposes the incoming request's headers: */
+const char *traceparent = request_header(request, "traceparent");
+forgeops_trace_t trace = forgeops_tracker_trace_start_with_traceparent(traceparent);
+handle(request);
+forgeops_tracker_trace_stop(&trace, "POST /orders");
+```
+
+Every error captured inside a trace (`forgeops_tracker_capture_error`, or a fatal signal on that
+thread, whose handler writes the id into the raw report alongside the breadcrumb trail) carries that
+trace's id; `forgeops_tracker_current_trace_id()` returns it too, for your own logs. ForgeOps can then
+show it next to errors from the other services that handled the same request. Errors captured
+outside a trace are unchanged. The trace id and the header exist even with `track_tracing = 0`,
+since they are also what links errors across services; only span reporting stops.
+
+The service on the other end must also report to ForgeOps (the Ruby SDK continues the trace
+automatically from 0.12.0), and both projects must be linked in ForgeOps to see them connected.
+
+Narrow or turn off where the header goes, for example if a third-party API rejects unknown headers:
+
+```c
+forgeops_configuration_t *config = forgeops_tracker_configuration();
+/* NULL (the default) means every host. Each host matches itself and its subdomains
+ * ("example.com" matches "api.example.com", never "badexample.com"). Copied, so the array
+ * can be a local. */
+const char *targets[] = {"example.com", "internal.corp"};
+forgeops_configuration_set_trace_propagation_targets(config, targets, 2);
+/* Or never send it at all (default 1): */
+config->propagate_traces = 0;
+```
+
+Host strings only: C has no standard regular expression type to accept patterns as, the way the
+clients for languages that do can.
 
 ## Custom metrics and infrastructure monitoring
 

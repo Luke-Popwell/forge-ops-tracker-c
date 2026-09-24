@@ -1,6 +1,8 @@
 #ifndef FORGEOPS_TRACKER_CONFIGURATION_H
 #define FORGEOPS_TRACKER_CONFIGURATION_H
 
+#include <stddef.h>
+
 /*
  * Holds a single ForgeOps DSN plus everything else the client needs to build and deliver events.
  * Mirrors gems/forge_ops_tracker's Configuration: a single DSN string carries both
@@ -68,9 +70,11 @@ typedef struct {
    */
   long performance_flush_interval_seconds;
   /*
-   * Whether forgeops_tracker_trace_begin starts a trace at all, and so whether spans are recorded
-   * and slow traces sent. Boolean: 1 = on (the default), 0 = off. This client has no web framework
-   * integration, so nothing starts a trace automatically: this gates the manual API.
+   * Whether a trace (forgeops_tracker_trace_start) is sent to ForgeOps when slow. Boolean: 1 = on
+   * (the default), 0 = off. With it off, a trace still starts and has an id, attached to errors
+   * captured inside it and handed out by forgeops_tracker_http_span_start (see propagate_traces),
+   * since that id is also what links an error here to one in another service; only span reporting
+   * stops. This client has no web framework integration, so nothing starts a trace automatically.
    */
   int track_tracing;
   /* A trace is only sent when its root span took at least this many milliseconds. 1000 by default. */
@@ -84,6 +88,23 @@ typedef struct {
   long metric_flush_interval_seconds;
   long infrastructure_metric_flush_interval_seconds;
   long timeout_seconds;
+  /*
+   * Whether forgeops_tracker_http_span_start hands back a W3C traceparent header for the outgoing
+   * call, so the service being called continues this trace. Boolean: 1 = on (the default), matching
+   * gems/forge_ops_tracker: the header carries the trace id that links an error here to an error
+   * there, which is useful with or without spans, so it goes out even with track_tracing off.
+   */
+  int propagate_traces;
+  /*
+   * Which hosts get that header. NULL (the default) means every host. Otherwise an array of
+   * trace_propagation_target_count heap strings, each matching that host and its subdomains on a dot
+   * boundary, ignoring case and a leading dot ("example.com" matches "api.example.com", never
+   * "badexample.com"); an empty array matches no host. Set it with
+   * forgeops_configuration_set_trace_propagation_targets, which copies. Host strings only: unlike
+   * the clients whose language has a standard regular expression type, there is no pattern form.
+   */
+  char **trace_propagation_targets;
+  int trace_propagation_target_count;
   int enabled_environment_count;
   char **enabled_environments;     /* array of enabled_environment_count heap strings */
 } forgeops_configuration_t;
@@ -132,5 +153,16 @@ char *forgeops_configuration_custom_metrics_url(const forgeops_configuration_t *
 char *forgeops_configuration_infrastructure_metrics_url(const forgeops_configuration_t *config);
 
 int forgeops_configuration_is_enabled(const forgeops_configuration_t *config);
+
+/*
+ * Replaces config->trace_propagation_targets with copies of hosts[0..count). hosts NULL restores the
+ * default (every host); a non-NULL hosts with count 0 means no host at all. The caller keeps
+ * ownership of hosts and may free it right after this returns.
+ */
+void forgeops_configuration_set_trace_propagation_targets(forgeops_configuration_t *config, const char **hosts, size_t count);
+
+/* 1 if an outgoing call to host should carry a traceparent header (see propagate_traces and
+ * trace_propagation_targets), 0 otherwise. A NULL or empty host only matches with no target list. */
+int forgeops_configuration_should_propagate_trace(const forgeops_configuration_t *config, const char *host);
 
 #endif

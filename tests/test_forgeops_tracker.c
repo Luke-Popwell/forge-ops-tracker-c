@@ -32,6 +32,8 @@
 #include "forgeops_tracker/pii_scrubber.h"
 #include "forgeops_tracker/reporter.h"
 #include "forgeops_tracker/signal_handler.h"
+#include "forgeops_tracker/spans.h"
+#include "forgeops_tracker/trace_parent.h"
 
 static int g_tests_run = 0;
 static int g_tests_failed = 0;
@@ -1651,18 +1653,22 @@ TEST(tracing_a_trace_under_the_threshold_is_never_queued_and_leaves_nothing_open
   forgeops_tracker_reset_for_testing();
 }
 
-TEST(tracing_track_tracing_off_or_reporting_disabled_starts_no_trace_and_every_call_is_a_no_op) {
+TEST(tracing_track_tracing_off_still_has_a_trace_id_but_never_sends_and_reporting_disabled_starts_nothing) {
   forgeops_configuration_t *config = tracing_test_setup(0);
   config->track_tracing = 0;
 
   forgeops_trace_t off = forgeops_tracker_trace_start();
-  ASSERT_TRUE(!off.owns);
-  ASSERT_TRUE(!forgeops_spans_active_for_testing());
+  ASSERT_TRUE(off.owns);
+  ASSERT_TRUE(forgeops_spans_active_for_testing());
+  ASSERT_NOT_NULL(forgeops_tracker_current_trace_id());
+  ASSERT_TRUE(strlen(forgeops_tracker_current_trace_id()) == 32);
   forgeops_span_t span = forgeops_tracker_span_start("x", "service");
-  ASSERT_TRUE(!span.state.active);
+  usleep(20000);
   forgeops_tracker_span_stop(&span);
-  forgeops_tracker_record_span("y", "database", 1700000000000LL, 1.0, NULL, NULL, 0);
   forgeops_tracker_trace_stop(&off, "root");
+  ASSERT_TRUE(!forgeops_spans_active_for_testing());
+  ASSERT_NULL(forgeops_tracker_current_trace_id());
+  ASSERT_TRUE(!forgeops_spans_worker_started_for_testing());
 
   config->track_tracing = 1;
   free(config->environment);
@@ -1670,6 +1676,11 @@ TEST(tracing_track_tracing_off_or_reporting_disabled_starts_no_trace_and_every_c
   forgeops_trace_t disabled = forgeops_tracker_trace_start();
   ASSERT_TRUE(!disabled.owns);
   ASSERT_TRUE(!forgeops_spans_active_for_testing());
+  forgeops_span_t no_op = forgeops_tracker_span_start("x", "service");
+  ASSERT_TRUE(!no_op.state.active);
+  forgeops_tracker_span_stop(&no_op);
+  forgeops_tracker_record_span("y", "database", 1700000000000LL, 1.0, NULL, NULL, 0);
+  forgeops_tracker_trace_stop(&disabled, "root");
   forgeops_tracker_reset_for_testing();
 }
 
@@ -1741,6 +1752,289 @@ TEST(tracing_an_ended_span_state_is_cleared_so_a_second_stop_records_nothing) {
   forgeops_tracker_span_stop(&span);
   ASSERT_TRUE(forgeops_spans_count_for_testing() == 1);
   forgeops_tracker_trace_stop(&trace, "root");
+  forgeops_tracker_reset_for_testing();
+}
+
+/* ---- Trace context (W3C traceparent) ------------------------------------------------------------ */
+
+#define TP_TRACE_ID "4bf92f3577b34da6a3ce929d0e0e4736"
+#define TP_SPAN_ID "00f067aa0ba902b7"
+
+TEST(traceparent_parses_a_valid_version_00_header) {
+  char trace_id[33] = {0}, parent[17] = {0};
+  ASSERT_TRUE(forgeops_traceparent_parse("00-" TP_TRACE_ID "-" TP_SPAN_ID "-01", trace_id, parent));
+  ASSERT_STREQ(trace_id, TP_TRACE_ID);
+  ASSERT_STREQ(parent, TP_SPAN_ID);
+  ASSERT_TRUE(forgeops_traceparent_parse("  00-" TP_TRACE_ID "-" TP_SPAN_ID "-00 ", trace_id, parent));
+}
+
+TEST(traceparent_rejects_anything_malformed) {
+  const char *bad[] = {
+    "",
+    "garbage",
+    "00-4BF92F3577B34DA6A3CE929D0E0E4736-" TP_SPAN_ID "-01",
+    "00-" TP_TRACE_ID "-00F067AA0BA902B7-01",
+    "ff-" TP_TRACE_ID "-" TP_SPAN_ID "-01",
+    "00-00000000000000000000000000000000-" TP_SPAN_ID "-01",
+    "00-" TP_TRACE_ID "-0000000000000000-01",
+    "00-4bf92f3577b34da6a3ce929d0e0e473-" TP_SPAN_ID "-01",
+    "00-" TP_TRACE_ID "-00f067aa0ba902b-01",
+    "00_" TP_TRACE_ID "-" TP_SPAN_ID "-01",
+    "00-" TP_TRACE_ID "-" TP_SPAN_ID "-1",
+    "00-" TP_TRACE_ID "-" TP_SPAN_ID "-01-extra",
+    "0g-" TP_TRACE_ID "-" TP_SPAN_ID "-01",
+    "01-" TP_TRACE_ID "-" TP_SPAN_ID "-01x",
+  };
+  char trace_id[33] = "untouched", parent[17] = "untouched";
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    if (forgeops_traceparent_parse(bad[i], trace_id, parent)) {
+      printf("  accepted \"%s\"\n", bad[i]);
+      ASSERT_TRUE(0);
+    }
+  }
+  ASSERT_TRUE(!forgeops_traceparent_parse(NULL, trace_id, parent));
+  ASSERT_STREQ(trace_id, "untouched");
+}
+
+TEST(traceparent_accepts_a_future_version_with_extra_fields) {
+  char trace_id[33] = {0}, parent[17] = {0};
+  ASSERT_TRUE(forgeops_traceparent_parse("01-" TP_TRACE_ID "-" TP_SPAN_ID "-01-what-comes-next", trace_id, parent));
+  ASSERT_STREQ(trace_id, TP_TRACE_ID);
+  ASSERT_TRUE(forgeops_traceparent_parse("01-" TP_TRACE_ID "-" TP_SPAN_ID "-01", trace_id, parent));
+}
+
+TEST(traceparent_builds_a_sampled_version_00_header_and_ids_are_lowercase_hex_never_all_zeros) {
+  char header[FORGEOPS_TRACEPARENT_SIZE];
+  forgeops_traceparent_build(TP_TRACE_ID, TP_SPAN_ID, header);
+  ASSERT_STREQ(header, "00-" TP_TRACE_ID "-" TP_SPAN_ID "-01");
+
+  char trace_id[33], span_id[17];
+  forgeops_trace_random_id(trace_id, 32);
+  forgeops_trace_random_id(span_id, 16);
+  ASSERT_TRUE(strlen(trace_id) == 32 && strlen(span_id) == 16);
+  ASSERT_TRUE(strspn(trace_id, "0123456789abcdef") == 32);
+  ASSERT_TRUE(strspn(span_id, "0123456789abcdef") == 16);
+  ASSERT_TRUE(strspn(trace_id, "0") < 32);
+}
+
+TEST(traceparent_url_host_extracts_just_the_lowercased_host) {
+  char host[64];
+  ASSERT_TRUE(forgeops_url_host("https://API.Example.com/orders/42?x=1", host, sizeof(host)));
+  ASSERT_STREQ(host, "api.example.com");
+  ASSERT_TRUE(forgeops_url_host("http://user:pw@example.com:8080/x", host, sizeof(host)));
+  ASSERT_STREQ(host, "example.com");
+  ASSERT_TRUE(forgeops_url_host("http://example.com?q=a@b", host, sizeof(host)));
+  ASSERT_STREQ(host, "example.com");
+  ASSERT_TRUE(forgeops_url_host("http://[::1]:3000/", host, sizeof(host)));
+  ASSERT_STREQ(host, "[::1]");
+  ASSERT_TRUE(!forgeops_url_host("example.com/no-scheme", host, sizeof(host)));
+  ASSERT_TRUE(!forgeops_url_host("http:///path-only", host, sizeof(host)));
+  ASSERT_TRUE(!forgeops_url_host(NULL, host, sizeof(host)));
+  ASSERT_TRUE(!forgeops_url_host("https://a-host-far-too-long-for-the-buffer.example.com/", host, 8));
+  ASSERT_STREQ(host, "");
+}
+
+TEST(trace_propagation_goes_to_every_host_by_default_and_nowhere_when_off) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  ASSERT_TRUE(config->propagate_traces == 1);
+  ASSERT_NULL(config->trace_propagation_targets);
+  ASSERT_TRUE(forgeops_configuration_should_propagate_trace(config, "anything.example"));
+  ASSERT_TRUE(forgeops_configuration_should_propagate_trace(config, NULL));
+  config->propagate_traces = 0;
+  ASSERT_TRUE(!forgeops_configuration_should_propagate_trace(config, "anything.example"));
+  forgeops_configuration_destroy(config);
+}
+
+TEST(trace_propagation_targets_match_on_a_dot_boundary_ignoring_case_and_a_leading_dot) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  char first[] = "Example.com";
+  const char *targets[] = {first, ".internal.corp", ""};
+  forgeops_configuration_set_trace_propagation_targets(config, targets, 3);
+  first[0] = 'X'; /* copied: the caller's own strings don't matter after the call */
+  ASSERT_TRUE(forgeops_configuration_should_propagate_trace(config, "example.com"));
+  ASSERT_TRUE(forgeops_configuration_should_propagate_trace(config, "API.example.COM"));
+  ASSERT_TRUE(forgeops_configuration_should_propagate_trace(config, "internal.corp"));
+  ASSERT_TRUE(forgeops_configuration_should_propagate_trace(config, "db.internal.corp"));
+  ASSERT_TRUE(!forgeops_configuration_should_propagate_trace(config, "badexample.com"));
+  ASSERT_TRUE(!forgeops_configuration_should_propagate_trace(config, "example.com.evil.net"));
+  ASSERT_TRUE(!forgeops_configuration_should_propagate_trace(config, "other.net"));
+  ASSERT_TRUE(!forgeops_configuration_should_propagate_trace(config, "examplf.com")); /* same length as a target, not equal */
+  ASSERT_TRUE(!forgeops_configuration_should_propagate_trace(config, NULL));
+
+  forgeops_configuration_set_trace_propagation_targets(config, targets, 0);
+  ASSERT_NOT_NULL(config->trace_propagation_targets);
+  ASSERT_TRUE(!forgeops_configuration_should_propagate_trace(config, "example.com"));
+
+  forgeops_configuration_set_trace_propagation_targets(config, NULL, 0);
+  ASSERT_TRUE(forgeops_configuration_should_propagate_trace(config, "other.net"));
+  forgeops_configuration_destroy(config);
+}
+
+TEST(trace_context_continuing_a_traceparent_keeps_its_id_and_the_http_span_names_itself_in_the_header) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-traceparent-body-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  tracing_test_setup(port);
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start_with_traceparent("00-" TP_TRACE_ID "-" TP_SPAN_ID "-01");
+  ASSERT_TRUE(trace.owns);
+  ASSERT_STREQ(forgeops_tracker_current_trace_id(), TP_TRACE_ID);
+  forgeops_http_span_t http = forgeops_tracker_http_span_start("post", "https://Payments.example.com/charges/42?token=secret");
+  ASSERT_TRUE(strncmp(http.traceparent, "00-" TP_TRACE_ID "-", 36) == 0);
+  ASSERT_TRUE(strncmp(http.traceparent + 36, http.state.id, 16) == 0); /* the span's own id, then "-01" */
+  ASSERT_STREQ(http.traceparent + 52, "-01");
+  char expected_header[FORGEOPS_TRACEPARENT_HEADER_LINE_SIZE];
+  snprintf(expected_header, sizeof(expected_header), "traceparent: %s", http.traceparent);
+  ASSERT_STREQ(http.header, expected_header);
+  forgeops_http_span_t copy = http; /* a copied struct stops the same span */
+  usleep(20000);
+  forgeops_tracker_http_span_stop(&copy);
+  forgeops_tracker_trace_stop(&trace, "POST /orders");
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strncmp(body, "{\"trace_id\":\"" TP_TRACE_ID "\"", 13 + 32 + 1) == 0);
+  char value[64], root_id[40];
+  ASSERT_TRUE(span_field(body, "POST /orders", "parent_span_id", value, sizeof(value)) && strcmp(value, TP_SPAN_ID) == 0);
+  ASSERT_TRUE(span_field(body, "POST /orders", "span_id", root_id, sizeof(root_id)));
+  ASSERT_TRUE(span_field(body, "POST payments.example.com", "span_id", value, sizeof(value)) && strcmp(value, http.state.id) == 0);
+  ASSERT_TRUE(span_field(body, "POST payments.example.com", "parent_span_id", value, sizeof(value)) && strcmp(value, root_id) == 0);
+  ASSERT_TRUE(span_field(body, "POST payments.example.com", "kind", value, sizeof(value)) && strcmp(value, "http") == 0);
+  ASSERT_TRUE(strstr(body, "secret") == NULL && strstr(body, "/charges") == NULL);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(trace_context_a_missing_or_malformed_traceparent_starts_a_fresh_trace) {
+  tracing_test_setup(0);
+  forgeops_trace_t trace = forgeops_tracker_trace_start_with_traceparent("00-nope");
+  ASSERT_TRUE(trace.owns);
+  ASSERT_NOT_NULL(forgeops_tracker_current_trace_id());
+  ASSERT_TRUE(strcmp(forgeops_tracker_current_trace_id(), TP_TRACE_ID) != 0);
+  ASSERT_TRUE(strlen(forgeops_tracker_current_trace_id()) == 32);
+  /* ignored inside an already-open trace */
+  forgeops_trace_t inner = forgeops_tracker_trace_start_with_traceparent("00-" TP_TRACE_ID "-" TP_SPAN_ID "-01");
+  ASSERT_TRUE(!inner.owns);
+  ASSERT_TRUE(strcmp(forgeops_tracker_current_trace_id(), TP_TRACE_ID) != 0);
+  forgeops_tracker_trace_stop(&trace, "root");
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(trace_context_no_header_outside_a_trace_off_target_or_with_propagation_off_but_the_span_still_records) {
+  forgeops_configuration_t *config = tracing_test_setup(0);
+  forgeops_http_span_t outside = forgeops_tracker_http_span_start("GET", "https://api.example.com/");
+  ASSERT_STREQ(outside.traceparent, "");
+  ASSERT_STREQ(outside.header, "");
+  ASSERT_TRUE(!outside.state.active);
+  forgeops_tracker_http_span_stop(&outside);
+  forgeops_tracker_http_span_stop(NULL);
+
+  const char *targets[] = {"example.com"};
+  forgeops_configuration_set_trace_propagation_targets(config, targets, 1);
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  forgeops_http_span_t off_target = forgeops_tracker_http_span_start("GET", "https://badexample.com/");
+  ASSERT_STREQ(off_target.traceparent, "");
+  ASSERT_TRUE(off_target.state.active);
+  forgeops_tracker_http_span_stop(&off_target);
+  forgeops_http_span_t on_target = forgeops_tracker_http_span_start("GET", "https://api.example.com/");
+  ASSERT_TRUE(on_target.traceparent[0] != '\0');
+  forgeops_tracker_http_span_stop(&on_target);
+  forgeops_http_span_t no_host = forgeops_tracker_http_span_start(NULL, "not a url");
+  ASSERT_STREQ(no_host.name, "GET unknown");
+  ASSERT_STREQ(no_host.traceparent, "");
+  forgeops_tracker_http_span_stop(&no_host);
+
+  config->propagate_traces = 0;
+  forgeops_configuration_set_trace_propagation_targets(config, NULL, 0);
+  forgeops_http_span_t off = forgeops_tracker_http_span_start("GET", "https://api.example.com/");
+  ASSERT_STREQ(off.traceparent, "");
+  forgeops_tracker_http_span_stop(&off);
+  ASSERT_TRUE(forgeops_spans_count_for_testing() == 4);
+  forgeops_tracker_trace_stop(&trace, "root");
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(trace_context_an_error_captured_inside_a_trace_carries_its_id_even_with_track_tracing_off) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("trace-id", dir, sizeof(dir));
+  config->track_tracing = 0;
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start_with_traceparent("00-" TP_TRACE_ID "-" TP_SPAN_ID "-01");
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
+  forgeops_tracker_trace_stop(&trace, "POST /orders");
+
+  char *contents = read_only_pending_report(config);
+  ASSERT_NOT_NULL(contents);
+  ASSERT_TRUE(strstr(contents, ",\"trace_id\":\"" TP_TRACE_ID "\"}") != NULL);
+  free(contents);
+  remove_directory_recursive(dir);
+
+  /* outside a trace, no trace_id key at all */
+  config = breadcrumb_test_setup("no-trace-id", dir, sizeof(dir));
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
+  contents = read_only_pending_report(config);
+  ASSERT_NOT_NULL(contents);
+  ASSERT_TRUE(strstr(contents, "\"trace_id\"") == NULL);
+  free(contents);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(trace_context_a_fatal_signal_inside_a_trace_carries_its_id) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("signal-trace", dir, sizeof(dir));
+  forgeops_signal_handler_install(dir);
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start_with_traceparent("00-" TP_TRACE_ID "-" TP_SPAN_ID "-01");
+  forgeops_tracker_add_breadcrumb("about to crash", NULL, NULL, NULL, NULL, 0);
+  forgeops_signal_handler_write_report(11);
+  forgeops_tracker_trace_stop(&trace, "root");
+
+  DIR *directory = opendir(dir);
+  ASSERT_NOT_NULL(directory);
+  char raw_path[512] = {0};
+  struct dirent *entry;
+  while ((entry = readdir(directory)) != NULL) {
+    if (strncmp(entry->d_name, "signal-11-", 10) == 0) snprintf(raw_path, sizeof(raw_path), "%s/%s", dir, entry->d_name);
+  }
+  closedir(directory);
+  ASSERT_TRUE(raw_path[0] != '\0');
+
+  char *json = forgeops_signal_handler_complete_json(config, raw_path);
+  ASSERT_NOT_NULL(json);
+  ASSERT_TRUE(strstr(json, ",\"trace_id\":\"" TP_TRACE_ID "\"}") != NULL);
+  ASSERT_TRUE(strstr(json, "\"message\":\"about to crash\"") != NULL);
+  /* The trace id line is its own field, never mistaken for a backtrace frame. */
+  ASSERT_TRUE(strstr(json, "\"method\":\"#trace_id") == NULL);
+
+  free(json);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(trace_context_a_cut_off_trace_id_line_in_a_raw_report_is_dropped) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("signal-trace-cut", dir, sizeof(dir));
+  mkdir(dir, 0755);
+  char raw_path[512];
+  snprintf(raw_path, sizeof(raw_path), "%s/signal-11-1.txt", dir);
+  FILE *f = fopen(raw_path, "w");
+  ASSERT_NOT_NULL(f);
+  fputs("Segmentation fault\n0 app 0x1 main + 1\n#trace_id 4bf92f3577b34da6\n", f);
+  fclose(f);
+
+  char *json = forgeops_signal_handler_complete_json(config, raw_path);
+  ASSERT_NOT_NULL(json);
+  ASSERT_TRUE(strstr(json, "\"trace_id\"") == NULL);
+  ASSERT_TRUE(strstr(json, "#trace_id") == NULL);
+
+  free(json);
+  remove_directory_recursive(dir);
   forgeops_tracker_reset_for_testing();
 }
 
@@ -2136,13 +2430,27 @@ int main(void) {
   RUN(tracing_a_slow_trace_is_delivered_to_spans_with_nested_spans_and_the_wire_shape);
   RUN(tracing_an_unknown_or_null_kind_is_sent_as_other_since_the_server_would_reject_the_whole_trace);
   RUN(tracing_a_trace_under_the_threshold_is_never_queued_and_leaves_nothing_open);
-  RUN(tracing_track_tracing_off_or_reporting_disabled_starts_no_trace_and_every_call_is_a_no_op);
+  RUN(tracing_track_tracing_off_still_has_a_trace_id_but_never_sends_and_reporting_disabled_starts_nothing);
   RUN(tracing_a_span_outside_a_trace_is_a_harmless_no_op);
   RUN(tracing_a_nested_trace_start_does_not_start_a_second_trace_and_its_stop_does_nothing);
   RUN(tracing_a_trace_holds_at_most_500_spans_including_the_root);
   RUN(tracing_the_open_trace_is_per_thread);
   RUN(tracing_spans_url_swaps_the_trailing_events_segment);
   RUN(tracing_an_ended_span_state_is_cleared_so_a_second_stop_records_nothing);
+
+  RUN(traceparent_parses_a_valid_version_00_header);
+  RUN(traceparent_rejects_anything_malformed);
+  RUN(traceparent_accepts_a_future_version_with_extra_fields);
+  RUN(traceparent_builds_a_sampled_version_00_header_and_ids_are_lowercase_hex_never_all_zeros);
+  RUN(traceparent_url_host_extracts_just_the_lowercased_host);
+  RUN(trace_propagation_goes_to_every_host_by_default_and_nowhere_when_off);
+  RUN(trace_propagation_targets_match_on_a_dot_boundary_ignoring_case_and_a_leading_dot);
+  RUN(trace_context_continuing_a_traceparent_keeps_its_id_and_the_http_span_names_itself_in_the_header);
+  RUN(trace_context_a_missing_or_malformed_traceparent_starts_a_fresh_trace);
+  RUN(trace_context_no_header_outside_a_trace_off_target_or_with_propagation_off_but_the_span_still_records);
+  RUN(trace_context_an_error_captured_inside_a_trace_carries_its_id_even_with_track_tracing_off);
+  RUN(trace_context_a_fatal_signal_inside_a_trace_carries_its_id);
+  RUN(trace_context_a_cut_off_trace_id_line_in_a_raw_report_is_dropped);
 
 
   RUN(metrics_flush_delivers_every_entry_as_one_batch_to_custom_metrics_with_the_wire_shape);

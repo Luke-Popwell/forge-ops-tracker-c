@@ -139,8 +139,9 @@ void forgeops_tracker_flush_performance(void);
  * Distributed tracing: one request's or job's own call tree, sent to ForgeOps only when the whole
  * thing took at least config->trace_capture_threshold_ms (1000 by default), so fast calls cost
  * nothing on the wire. Bracket the unit of work with trace_start/trace_stop, and anything inside it,
- * on the same thread, can add spans; a span nests under whichever span is open. Traces are per
- * service: nothing is propagated across services.
+ * on the same thread, can add spans; a span nests under whichever span is open. A trace can also be
+ * followed into the services you call and continued from the service that called you: see
+ * forgeops_tracker_trace_start_with_traceparent and forgeops_tracker_http_span_start below.
  *
  *     forgeops_trace_t trace = forgeops_tracker_trace_start();
  *     forgeops_span_t span = forgeops_tracker_span_start("charge card", "service");
@@ -152,7 +153,8 @@ void forgeops_tracker_flush_performance(void);
  * sent as "other", since the server rejects a whole trace over one unknown kind). Names are copied;
  * data is optional parallel key/value arrays (NULL/0 for none). A trace holds at most
  * FORGEOPS_SPANS_MAX_SPANS spans. Outside a trace every call here is a harmless no-op, as is
- * everything when config->track_tracing is 0 or reporting isn't enabled for this environment.
+ * everything when reporting isn't enabled for this environment. With config->track_tracing 0 a trace
+ * still starts (its id goes on errors and on the traceparent header) but is never sent.
  *
  * This client has no web framework integration, so nothing starts a trace or records a span
  * automatically: you bracket what you want traced. A trace_start inside an open trace does not start
@@ -178,6 +180,60 @@ typedef struct {
 
 forgeops_trace_t forgeops_tracker_trace_start(void);
 void forgeops_tracker_trace_stop(forgeops_trace_t *trace, const char *root_name);
+
+/*
+ * The same as forgeops_tracker_trace_start, continuing the caller's trace when traceparent is a usable
+ * W3C traceparent header value, typically the incoming request's own "traceparent" header: the trace
+ * keeps the caller's trace id, and its root span records the caller's span as its parent, so it nests
+ * under that span on ForgeOps. NULL, blank, or malformed starts a fresh trace, exactly like
+ * forgeops_tracker_trace_start. Ignored inside an already-open trace. The string is only read here.
+ *
+ *     forgeops_trace_t trace = forgeops_tracker_trace_start_with_traceparent(request_header(request, "traceparent"));
+ *     handle(request);
+ *     forgeops_tracker_trace_stop(&trace, "POST /orders");
+ */
+forgeops_trace_t forgeops_tracker_trace_start_with_traceparent(const char *traceparent);
+
+/*
+ * The id of the trace open on this thread (32 lowercase hex characters), or NULL outside a trace.
+ * Every error captured on this thread while it's open (forgeops_tracker_capture_error, or a fatal
+ * signal) carries it as "trace_id" automatically; this is for your own logs. Points into the trace
+ * itself: valid until its trace_stop, so copy it to keep it longer.
+ */
+const char *forgeops_tracker_current_trace_id(void);
+
+/*
+ * Times an outgoing HTTP call as an "http" span named "<METHOD> <host>" (never the path or query,
+ * which can carry ids or tokens) and hands back the W3C traceparent header to send with that request:
+ * its parent id is this span's own id, so the called service's root span nests under it when it
+ * continues the trace. traceparent is the bare value and header the whole "traceparent: <value>" line,
+ * ready for curl_slist_append; both are "" when there is nothing to send: outside a trace, with
+ * config->propagate_traces 0, or when the URL's host isn't in config->trace_propagation_targets.
+ * Outside a trace no span is recorded either, and stop is a harmless no-op.
+ *
+ *     forgeops_http_span_t http = forgeops_tracker_http_span_start("POST", url);
+ *     struct curl_slist *headers = NULL;
+ *     if (http.header[0] != '\0') headers = curl_slist_append(headers, http.header);
+ *     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+ *     CURLcode result = curl_easy_perform(curl);
+ *     forgeops_tracker_http_span_stop(&http);
+ *
+ * This client doesn't instrument libcurl (or any other HTTP client) on its own, so a call made
+ * without this carries no header. The struct holds its own copies of everything, so it may be copied
+ * or returned freely; stop it on the thread that started it.
+ */
+#define FORGEOPS_HTTP_SPAN_NAME_SIZE 300
+
+typedef struct {
+  char name[FORGEOPS_HTTP_SPAN_NAME_SIZE];
+  char traceparent[FORGEOPS_TRACEPARENT_SIZE];
+  char header[FORGEOPS_TRACEPARENT_HEADER_LINE_SIZE];
+  forgeops_span_state_t state;
+} forgeops_http_span_t;
+
+forgeops_http_span_t forgeops_tracker_http_span_start(const char *method, const char *url);
+void forgeops_tracker_http_span_stop(forgeops_http_span_t *span);
+void forgeops_tracker_http_span_stop_with_data(forgeops_http_span_t *span, const char **data_keys, const char **data_values, size_t data_count);
 forgeops_span_t forgeops_tracker_span_start(const char *name, const char *kind);
 void forgeops_tracker_span_stop(forgeops_span_t *span);
 void forgeops_tracker_span_stop_with_data(forgeops_span_t *span, const char **data_keys, const char **data_values, size_t data_count);

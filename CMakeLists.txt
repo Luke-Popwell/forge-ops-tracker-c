@@ -17,6 +17,7 @@ add_library(forgeops_tracker
     src/signal_handler.c
     src/breadcrumbs.c
     src/performance.c
+    src/trace_parent.c
     src/spans.c
     src/metrics.c
     src/reporter.c
