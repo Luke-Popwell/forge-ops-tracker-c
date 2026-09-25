@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "forgeops_tracker/breadcrumbs.h"
+#include "forgeops_tracker/changes.h"
 #include "forgeops_tracker/metrics.h"
 #include "forgeops_tracker/performance.h"
 #include "forgeops_tracker/reporter.h"
@@ -284,6 +285,16 @@ void forgeops_tracker_flush_metrics(void) {
   forgeops_metrics_flush(config, FORGEOPS_METRIC_INFRASTRUCTURE);
 }
 
+void forgeops_tracker_record_change(const char *kind, const char *title, const char **details_keys, const char **details_values, size_t details_count) {
+  forgeops_tracker_record_change_with_options(kind, title, details_keys, details_values, details_count, NULL);
+}
+
+void forgeops_tracker_record_change_with_options(const char *kind, const char *title, const char **details_keys, const char **details_values, size_t details_count, const forgeops_change_options_t *options) {
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  if (!forgeops_configuration_is_enabled(config)) return;
+  forgeops_changes_enqueue(config, forgeops_changes_build(config, kind, title, details_keys, details_values, details_count, options));
+}
+
 void forgeops_tracker_upload_pending_reports(void) {
   forgeops_upload_pending_reports(forgeops_tracker_configuration());
 }
@@ -291,6 +302,7 @@ void forgeops_tracker_upload_pending_reports(void) {
 void forgeops_tracker_reset_for_testing(void) {
   forgeops_metrics_reset_for_testing(); /* before the configuration is destroyed: the flush threads read it */
   forgeops_spans_reset_for_testing(); /* before the configuration is destroyed: the delivery thread reads it */
+  forgeops_changes_reset_for_testing(); /* before the configuration is destroyed: the delivery thread reads it */
   forgeops_performance_reset_for_testing(); /* before the configuration is destroyed: the flush thread reads it */
   forgeops_configuration_destroy(shared_configuration);
   shared_configuration = NULL;

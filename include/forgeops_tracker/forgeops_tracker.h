@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 
+#include "forgeops_tracker/changes.h"
 #include "forgeops_tracker/configuration.h"
 #include "forgeops_tracker/metrics.h"
 #include "forgeops_tracker/spans.h"
@@ -263,6 +264,34 @@ void forgeops_tracker_capture_infrastructure_metric(const char *name, double val
 
 /* Delivers every buffered metric and infrastructure reading right now. Synchronous: blocks on libcurl for up to config->timeout_seconds. */
 void forgeops_tracker_flush_metrics(void);
+
+/*
+ * Records one change you made (a feature flag flipped, a config value changed, a firmware setting
+ * pushed) so ForgeOps can show it next to the errors and slowdowns that followed it:
+ *
+ *     const char *keys[] = {"flag", "to"};
+ *     const char *values[] = {"new_checkout", "true"};
+ *     forgeops_tracker_record_change("feature_flag", "Enabled new checkout", keys, values, 2);
+ *
+ * kind is one of feature_flag, config, migration, dependency, infrastructure, other (NULL or anything
+ * else is sent as "other", since the server rejects an unknown kind). title is cut to 200 characters;
+ * a NULL or blank title records nothing. details is optional parallel key/value arrays (NULL/0 for
+ * none), sent as a JSON object of strings. environment defaults to config->environment and occurred_at
+ * to now; forgeops_tracker_record_change_with_options sets those and the rest of the optional fields
+ * (service, actor, url, and id, your own idempotency key so a retried call records the change once):
+ *
+ *     forgeops_change_options_t options = {.actor = "deploy-bot", .url = "https://example.com/pr/42"};
+ *     forgeops_tracker_record_change_with_options("config", "Raised the upload limit", NULL, NULL, 0, &options);
+ *
+ * Every string is copied before this returns. The change is queued for the same kind of background
+ * delivery thread traces use, so this never blocks on the network, and nothing it does can fail the
+ * caller: a full queue or a failed delivery (including the 403 a plan without change tracking
+ * returns) drops the change quietly. A no-op when reporting isn't enabled for this environment. An
+ * atexit hook delivers whatever is still queued on a normal exit. This client sends no automatic
+ * startup snapshot: every change is one you record.
+ */
+void forgeops_tracker_record_change(const char *kind, const char *title, const char **details_keys, const char **details_values, size_t details_count);
+void forgeops_tracker_record_change_with_options(const char *kind, const char *title, const char **details_keys, const char **details_values, size_t details_count, const forgeops_change_options_t *options);
 
 /* Uploads every pending report (from a past crash, or a past forgeops_tracker_capture_error call
  * whose upload hasn't happened yet). Synchronous: call it from your own background thread if

@@ -39,4 +39,11 @@ int forgeops_client_deliver_spans(const forgeops_configuration_t *config, const 
 int forgeops_client_deliver_metrics(const forgeops_configuration_t *config, const char *json_payload);
 int forgeops_client_deliver_infrastructure_metrics(const forgeops_configuration_t *config, const char *json_payload);
 
+/*
+ * Same delivery contract again, against the DSN's changes endpoint (see
+ * forgeops_configuration_changes_url). json_payload is one change, already encoded. A 403 (a plan
+ * without change tracking) is an ordinary non-2xx here: a quiet 0.
+ */
+int forgeops_client_deliver_changes(const forgeops_configuration_t *config, const char *json_payload);
+
 #endif

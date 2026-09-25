@@ -2340,6 +2340,141 @@ TEST(sql_event_builder_sends_the_procedure_name_by_default_and_the_statement_onl
   forgeops_configuration_destroy(config);
 }
 
+/* ---- Change tracking ------------------------------------------------------------------------------ */
+
+TEST(changes_build_sends_the_documented_shape_with_every_optional_field) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  free(config->environment);
+  config->environment = strdup("production");
+  const char *keys[] = {"flag", "to"};
+  const char *values[] = {"new_checkout", "true"};
+  forgeops_change_options_t options = {.service = "firmware", .actor = "luke", .url = "https://example.com/flags/1", .id = "change-1", .occurred_at_unix_ms = 1790337600123LL};
+
+  char *body = forgeops_changes_build(config, "feature_flag", "Enabled new checkout", keys, values, 2, &options);
+  ASSERT_STREQ(body, "{\"kind\":\"feature_flag\",\"title\":\"Enabled new checkout\",\"environment\":\"production\",\"occurred_at\":\"2026-09-25T12:00:00.123Z\",\"details\":{\"flag\":\"new_checkout\",\"to\":\"true\"},\"service\":\"firmware\",\"actor\":\"luke\",\"url\":\"https://example.com/flags/1\",\"id\":\"change-1\"}");
+  free(body);
+
+  options = (forgeops_change_options_t){.environment = "staging"};
+  body = forgeops_changes_build(config, "config", "x", NULL, NULL, 0, &options);
+  ASSERT_TRUE(strstr(body, "\"environment\":\"staging\"") != NULL);
+  free(body);
+
+  forgeops_configuration_destroy(config);
+}
+
+TEST(changes_build_defaults_environment_and_occurred_at_and_leaves_unset_keys_out) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  char *body = forgeops_changes_build(config, "config", "  Raised the upload limit\n", NULL, NULL, 0, NULL);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strncmp(body, "{\"kind\":\"config\",\"title\":\"Raised the upload limit\",\"environment\":\"development\",\"occurred_at\":\"20", 95) == 0);
+  ASSERT_TRUE(strstr(body, "Z\"}") != NULL && body[strlen(body) - 1] == '}');
+  ASSERT_TRUE(strstr(body, "details") == NULL && strstr(body, "service") == NULL && strstr(body, "actor") == NULL && strstr(body, "\"url\"") == NULL && strstr(body, "\"id\"") == NULL);
+  free(body);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(changes_an_unknown_or_null_kind_is_sent_as_other_and_every_known_kind_is_kept) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  const char *known[] = {"feature_flag", "config", "migration", "dependency", "infrastructure", "other"};
+  for (size_t i = 0; i < 6; i++) {
+    char *body = forgeops_changes_build(config, known[i], "t", NULL, NULL, 0, NULL);
+    char expected[64];
+    snprintf(expected, sizeof(expected), "{\"kind\":\"%s\",", known[i]);
+    ASSERT_TRUE(strncmp(body, expected, strlen(expected)) == 0);
+    free(body);
+  }
+  char *body = forgeops_changes_build(config, "deploy", "t", NULL, NULL, 0, NULL);
+  ASSERT_TRUE(strncmp(body, "{\"kind\":\"other\",", 16) == 0);
+  free(body);
+  body = forgeops_changes_build(config, NULL, "t", NULL, NULL, 0, NULL);
+  ASSERT_TRUE(strncmp(body, "{\"kind\":\"other\",", 16) == 0);
+  free(body);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(changes_a_long_title_is_cut_to_200_characters_never_mid_character_and_a_blank_one_builds_nothing) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  char title[512];
+  memset(title, 'a', 199);
+  strcpy(title + 199, "\xc3\xa9" "bcd"); /* 199 ASCII, then a two-byte e-acute as character 200 */
+  char *body = forgeops_changes_build(config, "other", title, NULL, NULL, 0, NULL);
+  char expected[256];
+  memset(expected, 'a', 199);
+  strcpy(expected + 199, "\xc3\xa9\"");
+  ASSERT_TRUE(strstr(body, expected) != NULL);
+  ASSERT_TRUE(strstr(body, "\xc3\xa9" "b") == NULL);
+  free(body);
+
+  ASSERT_NULL(forgeops_changes_build(config, "other", "   ", NULL, NULL, 0, NULL));
+  ASSERT_NULL(forgeops_changes_build(config, "other", NULL, NULL, NULL, 0, NULL));
+  forgeops_configuration_destroy(config);
+}
+
+TEST(changes_escape_quotes_and_control_characters_into_valid_json) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  const char *keys[] = {"note"};
+  const char *values[] = {"say \"hi\"\n"};
+  char *body = forgeops_changes_build(config, "other", "a\\b", keys, values, 1, NULL);
+  ASSERT_TRUE(strstr(body, "\"title\":\"a\\\\b\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"note\":\"say \\\"hi\\\"\\n\"") != NULL);
+  free(body);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(changes_record_change_delivers_to_the_changes_endpoint_and_is_a_no_op_when_disabled) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-changes-body-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  forgeops_configuration_t *config = performance_test_setup(port);
+
+  char *url = forgeops_configuration_changes_url(config);
+  char expected_url[128];
+  snprintf(expected_url, sizeof(expected_url), "http://127.0.0.1:%d/api/v1/changes", port);
+  ASSERT_STREQ(url, expected_url);
+  free(url);
+
+  /* The server serves one request: had the disabled call sent anything, that is what it would hold. */
+  free(config->environment);
+  config->environment = strdup("development");
+  forgeops_tracker_record_change("config", "Ignored while disabled", NULL, NULL, 0);
+  free(config->environment);
+  config->environment = strdup("production");
+  forgeops_change_options_t options = {.actor = "luke"};
+  forgeops_tracker_record_change_with_options("migration", "Added the orders index", NULL, NULL, 0, &options);
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"kind\":\"migration\",\"title\":\"Added the orders index\",\"environment\":\"production\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"actor\":\"luke\"") != NULL);
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(changes_record_change_never_fails_the_caller_on_a_403_or_an_unreachable_host) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-changes-403-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {403};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  performance_test_setup(port);
+  forgeops_tracker_record_change("config", "Plan without change tracking", NULL, NULL, 0);
+  waitpid(child, NULL, 0);
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "Plan without change tracking") != NULL);
+  free(body);
+  remove(body_path);
+
+  performance_test_setup(0); /* nothing listening */
+  forgeops_tracker_record_change("config", "Nobody listening", NULL, NULL, 0);
+  forgeops_tracker_reset_for_testing(); /* joins the delivery thread: reaching here is the assertion */
+  ASSERT_TRUE(1);
+}
+
 int main(void) {
   RUN(sql_mask_replaces_strings_and_numbers_but_not_identifiers_or_placeholders);
   RUN(sql_mask_handles_an_escaped_quote_a_cut_off_string_and_a_dollar_quoted_body);
@@ -2462,6 +2597,14 @@ int main(void) {
   RUN(metrics_captures_are_a_no_op_when_reporting_is_not_enabled_for_this_environment);
   RUN(metrics_urls_swap_the_trailing_events_segment);
   RUN(metrics_a_program_that_captures_a_reading_and_just_exits_still_delivers_it_from_its_atexit_hook);
+
+  RUN(changes_build_sends_the_documented_shape_with_every_optional_field);
+  RUN(changes_build_defaults_environment_and_occurred_at_and_leaves_unset_keys_out);
+  RUN(changes_an_unknown_or_null_kind_is_sent_as_other_and_every_known_kind_is_kept);
+  RUN(changes_a_long_title_is_cut_to_200_characters_never_mid_character_and_a_blank_one_builds_nothing);
+  RUN(changes_escape_quotes_and_control_characters_into_valid_json);
+  RUN(changes_record_change_delivers_to_the_changes_endpoint_and_is_a_no_op_when_disabled);
+  RUN(changes_record_change_never_fails_the_caller_on_a_403_or_an_unreachable_host);
 
   printf("\n%d run, %d failed\n", g_tests_run, g_tests_failed);
   return g_tests_failed == 0 ? 0 : 1;

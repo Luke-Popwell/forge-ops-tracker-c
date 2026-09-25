@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.4.0
+  GIT_TAG v0.5.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -342,6 +342,49 @@ succeeds, since a plan without the feature rejects every flush and would otherwi
 as the process lives. A NaN or infinite value is dropped at capture: `printf` would write `nan`/`inf`,
 which is not valid JSON and would make the server reject the whole batch behind it. Requires a
 ForgeOps plan that includes custom metrics / infrastructure monitoring.
+
+## Recording changes
+
+Tell ForgeOps when something changed outside a release (a feature flag flipped, a config value
+changed, a firmware setting pushed to a device) so it shows up next to the errors and slowdowns that
+followed:
+
+```c
+#include <stdlib.h>
+#include <string.h>
+
+#include <forgeops_tracker/forgeops_tracker.h>
+
+int main(void) {
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_set_dsn(config, "https://<api_key>@getforgeops.net/api/v1/events");
+  free(config->environment);
+  config->environment = strdup("production");
+
+  const char *keys[] = {"flag", "to"};
+  const char *values[] = {"new_checkout", "true"};
+  forgeops_tracker_record_change("feature_flag", "Enabled new checkout", keys, values, 2);
+
+  forgeops_change_options_t options = {.actor = "deploy-bot", .url = "https://example.com/pr/42"};
+  forgeops_tracker_record_change_with_options("config", "Raised the upload limit", NULL, NULL, 0, &options);
+  return 0; /* the atexit hook delivers anything still queued */
+}
+```
+
+`kind` is one of `feature_flag`, `config`, `migration`, `dependency`, `infrastructure` or `other`;
+`NULL` or anything else is sent as `other`. The title is cut to 200 characters (never through a
+multibyte UTF-8 character), and a blank one records nothing. `details` are parallel key/value arrays
+sent as a JSON object of strings. `forgeops_change_options_t` is all optional: `environment` defaults
+to `config->environment`, `occurred_at_unix_ms` 0 means now, and `service`, `actor`, `url` and `id`
+(your own idempotency key, so a retried call records the change once) are left out when `NULL`.
+
+Every string is copied before the call returns. Delivery runs on a background pthread fed by a
+bounded queue of 100, the same shape tracing uses, so the call never blocks on the network, and an
+`atexit` hook drains the queue on a normal exit. Nothing it does can fail the caller: a full queue or
+a failed delivery (including the 403 a plan without change tracking returns) drops the change quietly.
+It is a no-op when reporting isn't enabled for the environment. This client runs on devices and
+embedded targets as well as servers, so it sends no automatic startup snapshot; every change is one
+you record.
 
 ## Why a report always uploads on the *next* call, not live during the error itself
 

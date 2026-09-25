@@ -152,6 +152,9 @@ char *forgeops_configuration_spans_url(const forgeops_configuration_t *config);
 char *forgeops_configuration_custom_metrics_url(const forgeops_configuration_t *config);
 char *forgeops_configuration_infrastructure_metrics_url(const forgeops_configuration_t *config);
 
+/* Same derivation again, swapping the trailing "/events" for "/changes". Newly-allocated, or NULL. */
+char *forgeops_configuration_changes_url(const forgeops_configuration_t *config);
+
 int forgeops_configuration_is_enabled(const forgeops_configuration_t *config);
 
 /*

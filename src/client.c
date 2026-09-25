@@ -74,6 +74,10 @@ int forgeops_client_deliver_metrics(const forgeops_configuration_t *config, cons
   return post_json(config, forgeops_configuration_custom_metrics_url(config), json_payload);
 }
 
+int forgeops_client_deliver_changes(const forgeops_configuration_t *config, const char *json_payload) {
+  return post_json(config, forgeops_configuration_changes_url(config), json_payload);
+}
+
 int forgeops_client_deliver_infrastructure_metrics(const forgeops_configuration_t *config, const char *json_payload) {
   return post_json(config, forgeops_configuration_infrastructure_metrics_url(config), json_payload);
 }

@@ -275,6 +275,10 @@ char *forgeops_configuration_infrastructure_metrics_url(const forgeops_configura
   return swap_events_suffix(config, "/infrastructure_metrics");
 }
 
+char *forgeops_configuration_changes_url(const forgeops_configuration_t *config) {
+  return swap_events_suffix(config, "/changes");
+}
+
 char *forgeops_configuration_spans_url(const forgeops_configuration_t *config) {
   char *url = forgeops_configuration_ingestion_url(config);
   if (url == NULL) return NULL;

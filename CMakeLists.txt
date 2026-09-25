@@ -20,6 +20,7 @@ add_library(forgeops_tracker
     src/trace_parent.c
     src/spans.c
     src/metrics.c
+    src/changes.c
     src/reporter.c
     src/forgeops_tracker.c
 )
