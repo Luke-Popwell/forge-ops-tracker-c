@@ -243,6 +243,22 @@ void forgeops_tracker_span_stop_with_data(forgeops_span_t *span, const char **da
 void forgeops_tracker_record_span(const char *name, const char *kind, long long started_at_unix_ms, double duration_ms, const char **data_keys, const char **data_values, size_t data_count);
 
 /*
+ * A "database" span that carries the SQL it ran (a local SQLite query, say) and which database it
+ * was (db_system, such as "sqlite" or "postgresql"): sent in the span's data as "db.statement", with
+ * every string and number literal replaced by "?" first (so values never leave the process) and cut
+ * at 4000 characters, and "db.system", lowercased. Either may be NULL. Both are ignored on a span of
+ * any other kind. A "db.statement" passed in the data arrays directly is masked the same way.
+ * statement is only read during the call, never kept.
+ *
+ *     const char *sql = "SELECT * FROM orders WHERE customer_id = 42";
+ *     forgeops_span_t span = forgeops_tracker_span_start("Load orders", "database");
+ *     sqlite3_exec(db, sql, on_row, NULL, NULL);
+ *     forgeops_tracker_span_stop_with_sql(&span, sql, "sqlite", NULL, NULL, 0);
+ */
+void forgeops_tracker_span_stop_with_sql(forgeops_span_t *span, const char *statement, const char *db_system, const char **data_keys, const char **data_values, size_t data_count);
+void forgeops_tracker_record_span_with_sql(const char *name, const char *kind, long long started_at_unix_ms, double duration_ms, const char *statement, const char *db_system, const char **data_keys, const char **data_values, size_t data_count);
+
+/*
  * Custom metrics and infrastructure monitoring: two explicit calls (nothing is automatic, so there is no
  * track_metrics flag). forgeops_tracker_capture_metric records a named business event (a signup, a
  * payment, anything you want to name): pass 1.0 for a bare counter or a real magnitude, and it may be

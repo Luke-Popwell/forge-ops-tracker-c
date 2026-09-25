@@ -1,5 +1,6 @@
 #include "forgeops_tracker/spans.h"
 
+#include <ctype.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 #include <unistd.h>
 
 #include "forgeops_tracker/client.h"
+#include "forgeops_tracker/sql_statement.h"
 #include "strbuf.h"
 
 typedef struct {
@@ -79,7 +81,26 @@ static void append_timestamp(forgeops_strbuf_t *out, long long unix_ms) {
   append_json_string(out, formatted);
 }
 
-/* One span as a JSON object; parent NULL encodes null (the root). */
+/* A trimmed, lowercased copy of value (malloc'd), or NULL for a NULL or blank one. */
+static char *lowercase_trimmed(const char *value) {
+  if (value == NULL) return NULL;
+  while (isspace((unsigned char)*value)) value++;
+  size_t n = strlen(value);
+  while (n > 0 && isspace((unsigned char)value[n - 1])) n--;
+  if (n == 0) return NULL;
+  char *out = malloc(n + 1);
+  if (out == NULL) return NULL;
+  for (size_t i = 0; i < n; i++) out[i] = (char)tolower((unsigned char)value[i]);
+  out[n] = '\0';
+  return out;
+}
+
+/*
+ * One span as a JSON object; parent NULL encodes null (the root). On a "database" span, a
+ * "db.statement" value is masked with forgeops_sql_mask (every string and number literal becomes
+ * "?", cut at 4000 characters) and a "db.system" value is lowercased, so raw SQL can never go out on
+ * a span; a blank one is left out.
+ */
 static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *config, const char *id, const char *parent, const char *name, const char *kind, long long started_at_unix_ms, double duration_ms, const char **data_keys, const char **data_values, size_t data_count) {
   forgeops_strbuf_append_str(out, "{\"span_id\":");
   append_json_string(out, id);
@@ -106,11 +127,25 @@ static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *
     forgeops_strbuf_append_str(out, "null");
   }
   forgeops_strbuf_append_str(out, ",\"data\":{");
+  int database = strcmp(normalize_kind(kind), "database") == 0;
+  size_t written = 0;
   for (size_t i = 0; i < data_count; i++) {
-    if (i > 0) forgeops_strbuf_append(out, ",", 1);
+    const char *value = data_values[i];
+    char *owned = NULL;
+    if (database && data_keys[i] != NULL && strcmp(data_keys[i], "db.statement") == 0) {
+      owned = forgeops_sql_mask(value);
+      if (owned == NULL) continue;
+      value = owned;
+    } else if (database && data_keys[i] != NULL && strcmp(data_keys[i], "db.system") == 0) {
+      owned = lowercase_trimmed(value);
+      if (owned == NULL) continue;
+      value = owned;
+    }
+    if (written++ > 0) forgeops_strbuf_append(out, ",", 1);
     append_json_string(out, data_keys[i]);
     forgeops_strbuf_append(out, ":", 1);
-    append_json_string(out, data_values[i]);
+    append_json_string(out, value);
+    free(owned);
   }
   forgeops_strbuf_append_str(out, "}}");
 }

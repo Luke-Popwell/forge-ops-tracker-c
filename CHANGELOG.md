@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.0 (2026-09-25)
+
+- A `database` span can now carry the SQL it ran, such as an embedded SQLite query: new `forgeops_tracker_span_stop_with_sql(span, statement, db_system, keys, values, count)` and `forgeops_tracker_record_span_with_sql(name, kind, started_at_unix_ms, duration_ms, statement, db_system, keys, values, count)`. The statement is masked before it leaves the process (every string and number literal becomes `?`), cut at 4000 characters, and sent in the span's data as `db.statement`, with `db.system` lowercased; either may be `NULL`. A `db.statement` passed in the data arrays of a `database` span directly is masked the same way. Both are ignored on spans of any other kind.
+
 ## 0.5.0 (2026-09-25)
 
 - Change tracking: `forgeops_tracker_record_change(kind, title, details_keys, details_values, details_count)` records one change you made (a feature flag flipped, a config value changed, a firmware setting pushed) so ForgeOps can show it next to the errors and slowdowns that followed. `forgeops_tracker_record_change_with_options` also takes a `forgeops_change_options_t` for `environment` (default `config->environment`), `service`, `actor`, `url`, `id` (an idempotency key) and `occurred_at_unix_ms` (default now). `kind` is one of `feature_flag`, `config`, `migration`, `dependency`, `infrastructure` or `other`; `NULL` or anything else is sent as `other`. The title is cut to 200 characters, never through a multibyte UTF-8 character, and a blank one records nothing. Every string is copied, and delivery runs on a background pthread fed by a bounded queue (the same shape tracing uses) with an `atexit` hook that drains it on a normal exit, so the call never blocks on the network; a full queue or a failed delivery, including a 403 on a plan without change tracking, drops the change quietly. A no-op when reporting isn't enabled. This client sends no startup snapshot of its own.

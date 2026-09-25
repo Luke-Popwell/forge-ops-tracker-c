@@ -214,6 +214,65 @@ void forgeops_tracker_record_span(const char *name, const char *kind, long long 
   forgeops_spans_record(forgeops_tracker_configuration(), name != NULL ? name : "span", kind, started_at_unix_ms, duration_ms, data_keys, data_values, data_count);
 }
 
+/* A span's data arrays with a "database" span's statement and system added (still raw: spans.c masks
+ * every database span's "db.statement" as it encodes it), replacing any passed in the data itself.
+ * Returns 1 with freshly allocated arrays (free both; the strings are borrowed), or 0 to use the data
+ * unchanged: another kind, nothing to add, or an allocation failure. */
+static int with_sql(const char *kind, const char *statement, const char *db_system, const char **data_keys, const char **data_values, size_t data_count, const char ***out_keys, const char ***out_values, size_t *out_count) {
+  if (kind == NULL || strcmp(kind, "database") != 0 || (statement == NULL && db_system == NULL)) return 0;
+  const char **keys = malloc((data_count + 2) * sizeof(*keys));
+  const char **values = malloc((data_count + 2) * sizeof(*values));
+  if (keys == NULL || values == NULL) {
+    free(keys);
+    free(values);
+    return 0;
+  }
+  size_t n = 0;
+  for (size_t i = 0; i < data_count; i++) {
+    const char *key = data_keys[i];
+    if (key != NULL && ((statement != NULL && strcmp(key, "db.statement") == 0) || (db_system != NULL && strcmp(key, "db.system") == 0))) continue;
+    keys[n] = key;
+    values[n++] = data_values[i];
+  }
+  if (statement != NULL) {
+    keys[n] = "db.statement";
+    values[n++] = statement;
+  }
+  if (db_system != NULL) {
+    keys[n] = "db.system";
+    values[n++] = db_system;
+  }
+  *out_keys = keys;
+  *out_values = values;
+  *out_count = n;
+  return 1;
+}
+
+void forgeops_tracker_span_stop_with_sql(forgeops_span_t *span, const char *statement, const char *db_system, const char **data_keys, const char **data_values, size_t data_count) {
+  if (span == NULL || !span->state.active) return;
+  const char **keys, **values;
+  size_t count;
+  if (!with_sql(span->kind, statement, db_system, data_keys, data_values, data_count, &keys, &values, &count)) {
+    forgeops_tracker_span_stop_with_data(span, data_keys, data_values, data_count);
+    return;
+  }
+  forgeops_tracker_span_stop_with_data(span, keys, values, count);
+  free(keys);
+  free(values);
+}
+
+void forgeops_tracker_record_span_with_sql(const char *name, const char *kind, long long started_at_unix_ms, double duration_ms, const char *statement, const char *db_system, const char **data_keys, const char **data_values, size_t data_count) {
+  const char **keys, **values;
+  size_t count;
+  if (!with_sql(kind, statement, db_system, data_keys, data_values, data_count, &keys, &values, &count)) {
+    forgeops_tracker_record_span(name, kind, started_at_unix_ms, duration_ms, data_keys, data_values, data_count);
+    return;
+  }
+  forgeops_tracker_record_span(name, kind, started_at_unix_ms, duration_ms, keys, values, count);
+  free(keys);
+  free(values);
+}
+
 /* Appends `value` as a JSON string literal (quotes, backslashes and control characters escaped). */
 static void append_json_string(forgeops_strbuf_t *out, const char *value) {
   forgeops_strbuf_append(out, "\"", 1);

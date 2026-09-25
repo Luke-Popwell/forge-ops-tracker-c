@@ -1639,6 +1639,79 @@ TEST(tracing_an_unknown_or_null_kind_is_sent_as_other_since_the_server_would_rej
   forgeops_tracker_reset_for_testing();
 }
 
+TEST(tracing_a_database_span_sends_its_statement_masked_as_db_statement_with_db_system) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-spans-sql-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  tracing_test_setup(port);
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  forgeops_span_t load = forgeops_tracker_span_start("Load orders", "database");
+  usleep(20000);
+  const char *keys[] = {"rows", "db.statement"};
+  const char *values[] = {"3", "SELECT 'replaced by the argument'"};
+  forgeops_tracker_span_stop_with_sql(&load, "SELECT * FROM orders WHERE email = 'a@b.co' AND total > 4200", " SQLite ", keys, values, 2);
+  const char *direct_keys[] = {"db.statement"};
+  const char *direct_values[] = {"SELECT count(*) FROM carts WHERE code = 'private-value'"};
+  forgeops_tracker_record_span("Count", "database", 1700000000000LL, 1.0, direct_keys, direct_values, 1);
+  forgeops_tracker_record_span_with_sql("Recorded", "database", 1700000000000LL, 1.0, "DELETE FROM saves WHERE slot = 2", NULL, NULL, NULL, 0);
+  forgeops_tracker_record_span_with_sql("Not db", "service", 1700000000000LL, 1.0, "SELECT 'x'", "sqlite", NULL, NULL, 0);
+  forgeops_tracker_trace_stop(&trace, "root");
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"data\":{\"rows\":\"3\",\"db.statement\":\"SELECT * FROM orders WHERE email = ? AND total > ?\",\"db.system\":\"sqlite\"}") != NULL);
+  ASSERT_TRUE(strstr(body, "\"data\":{\"db.statement\":\"SELECT count(*) FROM carts WHERE code = ?\"}") != NULL);
+  ASSERT_TRUE(strstr(body, "\"data\":{\"db.statement\":\"DELETE FROM saves WHERE slot = ?\"}") != NULL);
+  ASSERT_TRUE(strstr(body, "\"name\":\"Not db\"") != NULL);
+  ASSERT_TRUE(strstr(body, "a@b.co") == NULL);
+  ASSERT_TRUE(strstr(body, "private-value") == NULL);
+  ASSERT_TRUE(strstr(body, "replaced by the argument") == NULL);
+  ASSERT_TRUE(strstr(body, "'x'") == NULL);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracing_a_database_statement_is_cut_at_4000_characters) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-spans-sql-long-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  tracing_test_setup(port);
+
+  char *sql = malloc(7 + 3 * 3000 + 9);
+  ASSERT_NOT_NULL(sql);
+  strcpy(sql, "SELECT ");
+  for (int i = 0; i < 3000; i++) strcat(sql, "a, ");
+  strcat(sql, "b FROM t");
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  forgeops_tracker_record_span_with_sql("big", "database", 1700000000000LL, 1.0, sql, NULL, NULL, NULL, 0);
+  usleep(20000);
+  forgeops_tracker_trace_stop(&trace, "root");
+  waitpid(child, NULL, 0);
+  free(sql);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  const char *start = strstr(body, "\"db.statement\":\"");
+  ASSERT_NOT_NULL(start);
+  start += strlen("\"db.statement\":\"");
+  const char *end = strchr(start, '"');
+  ASSERT_NOT_NULL(end);
+  ASSERT_TRUE(end - start == 4003);
+  ASSERT_TRUE(strncmp(end - 3, "...", 3) == 0);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
 TEST(tracing_a_trace_under_the_threshold_is_never_queued_and_leaves_nothing_open) {
   forgeops_configuration_t *config = tracing_test_setup(0);
   config->trace_capture_threshold_ms = 60000;
@@ -2564,6 +2637,8 @@ int main(void) {
 
   RUN(tracing_a_slow_trace_is_delivered_to_spans_with_nested_spans_and_the_wire_shape);
   RUN(tracing_an_unknown_or_null_kind_is_sent_as_other_since_the_server_would_reject_the_whole_trace);
+  RUN(tracing_a_database_span_sends_its_statement_masked_as_db_statement_with_db_system);
+  RUN(tracing_a_database_statement_is_cut_at_4000_characters);
   RUN(tracing_a_trace_under_the_threshold_is_never_queued_and_leaves_nothing_open);
   RUN(tracing_track_tracing_off_still_has_a_trace_id_but_never_sends_and_reporting_disabled_starts_nothing);
   RUN(tracing_a_span_outside_a_trace_is_a_harmless_no_op);
