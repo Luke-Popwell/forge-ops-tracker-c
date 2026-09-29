@@ -21,8 +21,15 @@
 
 /* Returns a newly-allocated copy of `statement` with every string literal and number replaced by
  * "?", truncated to 4000 characters, or NULL for a NULL/blank statement (or on allocation
- * failure). The caller must free a non-NULL return value. */
+ * failure). The caller must free a non-NULL return value. "double quoted" text is left alone, since
+ * in SQL it's an identifier (a column named "user id"), not a value. */
 char *forgeops_sql_mask(const char *statement);
+
+/* forgeops_sql_mask for a statement from a known database: `db_system` is its db.system name, or
+ * NULL when unknown. For "mysql" or "mariadb" (any case), where "double quoted" text is a string,
+ * that's masked too; any other value masks exactly as forgeops_sql_mask does. The caller must free a
+ * non-NULL return value. */
+char *forgeops_sql_mask_for_system(const char *statement, const char *db_system);
 
 /* Takes an already-masked statement (so a keyword inside a string value can't be mistaken for SQL)
  * and returns the names it touched as a newly-allocated JSON object,

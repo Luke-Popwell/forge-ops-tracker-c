@@ -97,9 +97,9 @@ static char *lowercase_trimmed(const char *value) {
 
 /*
  * One span as a JSON object; parent NULL encodes null (the root). On a "database" span, a
- * "db.statement" value is masked with forgeops_sql_mask (every string and number literal becomes
- * "?", cut at 4000 characters) and a "db.system" value is lowercased, so raw SQL can never go out on
- * a span; a blank one is left out.
+ * "db.statement" value is masked with forgeops_sql_mask_for_system for the span's db.system (every
+ * string and number literal becomes "?", cut at 4000 characters) and a "db.system" value is
+ * lowercased, so raw SQL can never go out on a span; a blank one is left out.
  */
 static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *config, const char *id, const char *parent, const char *name, const char *kind, long long started_at_unix_ms, double duration_ms, const char **data_keys, const char **data_values, size_t data_count) {
   forgeops_strbuf_append_str(out, "{\"span_id\":");
@@ -128,12 +128,18 @@ static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *
   }
   forgeops_strbuf_append_str(out, ",\"data\":{");
   int database = strcmp(normalize_kind(kind), "database") == 0;
+  /* The db.system that goes out with the statement, so a MySQL or MariaDB statement's "double
+   * quoted" strings are masked too. */
+  char *db_system = NULL;
+  for (size_t i = 0; database && db_system == NULL && i < data_count; i++) {
+    if (data_keys[i] != NULL && strcmp(data_keys[i], "db.system") == 0) db_system = lowercase_trimmed(data_values[i]);
+  }
   size_t written = 0;
   for (size_t i = 0; i < data_count; i++) {
     const char *value = data_values[i];
     char *owned = NULL;
     if (database && data_keys[i] != NULL && strcmp(data_keys[i], "db.statement") == 0) {
-      owned = forgeops_sql_mask(value);
+      owned = forgeops_sql_mask_for_system(value, db_system);
       if (owned == NULL) continue;
       value = owned;
     } else if (database && data_keys[i] != NULL && strcmp(data_keys[i], "db.system") == 0) {
@@ -147,6 +153,7 @@ static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *
     append_json_string(out, value);
     free(owned);
   }
+  free(db_system);
   forgeops_strbuf_append_str(out, "}}");
 }
 

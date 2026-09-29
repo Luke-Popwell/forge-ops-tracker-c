@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.6.0
+  GIT_TAG v0.7.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -267,6 +267,11 @@ forgeops_tracker_record_span_with_sql("Load readings", "database", started_at_un
 
 The statement is only read during the call; the masked copy is what the trace keeps. A
 `db.statement` you pass in the data arrays of any `database` span is masked the same way.
+Strings with backslash escapes (`'o\'brien'`) or a type prefix (`E''`, `X''`, `N''`, `B''`,
+`U&''`) and hex, binary and exponent numbers (`0x1F`, `0b101`, `1.5E-3`) are masked too, and with
+`db.system` `"mysql"` or `"mariadb"` so is "double quoted" text, a string there; on any other
+database it's a name and is left alone. `forgeops_sql_mask_for_system(statement, db_system)` in
+`forgeops_tracker/sql_statement.h` is the masker itself, to see what a statement becomes.
 
 ### Following a request across services
 

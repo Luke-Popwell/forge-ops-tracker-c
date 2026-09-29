@@ -1677,6 +1677,37 @@ TEST(tracing_a_database_span_sends_its_statement_masked_as_db_statement_with_db_
   forgeops_tracker_reset_for_testing();
 }
 
+TEST(tracing_a_mysql_or_mariadb_span_masks_double_quoted_strings_too) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-spans-sql-mysql-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  tracing_test_setup(port);
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  forgeops_tracker_record_span_with_sql("My", "database", 1700000000000LL, 1.0, "SELECT \"name\" FROM users WHERE token = \"tok-secret\"", " MySQL ", NULL, NULL, 0);
+  const char *keys[] = {"db.system", "db.statement"};
+  const char *values[] = {"MariaDB", "UPDATE t SET v = \"maria-secret\""};
+  forgeops_tracker_record_span("Maria", "database", 1700000000000LL, 1.0, keys, values, 2);
+  forgeops_tracker_record_span_with_sql("Pg", "database", 1700000000000LL, 1.0, "SELECT \"user id\" FROM t", "postgresql", NULL, NULL, 0);
+  usleep(20000);
+  forgeops_tracker_trace_stop(&trace, "root");
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"data\":{\"db.statement\":\"SELECT ? FROM users WHERE token = ?\",\"db.system\":\"mysql\"}") != NULL);
+  ASSERT_TRUE(strstr(body, "\"data\":{\"db.system\":\"mariadb\",\"db.statement\":\"UPDATE t SET v = ?\"}") != NULL);
+  ASSERT_TRUE(strstr(body, "\"db.statement\":\"SELECT \\\"user id\\\" FROM t\"") != NULL);
+  ASSERT_TRUE(strstr(body, "tok-secret") == NULL);
+  ASSERT_TRUE(strstr(body, "maria-secret") == NULL);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
 TEST(tracing_a_database_statement_is_cut_at_4000_characters) {
   char body_path[128];
   snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-spans-sql-long-%d.json", getpid());
@@ -2364,6 +2395,64 @@ TEST(sql_mask_is_idempotent_truncates_and_returns_null_for_blank) {
   ASSERT_TRUE(forgeops_sql_mask(NULL) == NULL);
 }
 
+/* The shared masking corpus: the same cases, with the same expected output, are checked in every
+ * SDK and against the server's SqlStatementMasker. A NULL system is forgeops_sql_mask itself. */
+static const struct {
+  const char *input;
+  const char *system;
+  const char *expected;
+} sql_mask_corpus[] = {
+    {"SELECT * FROM orders WHERE email = 'a@b.co' AND id = 42 LIMIT 10", NULL, "SELECT * FROM orders WHERE email = ? AND id = ? LIMIT ?"},
+    {"EXEC sp_note @text = 'it''s broken'", NULL, "EXEC sp_note @text = ?"},
+    {"SELECT 1 WHERE name = 'unterminated", NULL, "SELECT ? WHERE name = ?"},
+    {"DO $body$ BEGIN PERFORM 1; END $body$", NULL, "DO ?"},
+    {"SELECT \"user id\" FROM orders2 WHERE id = $1 AND v = sp_v2(?)", NULL, "SELECT \"user id\" FROM orders2 WHERE id = $1 AND v = sp_v2(?)"},
+    {"SELECT price * 1.5 FROM t", NULL, "SELECT price * ? FROM t"},
+    {"SELECT * FROM users WHERE name = E'o\\'brien' AND id = 1", NULL, "SELECT * FROM users WHERE name = ? AND id = ?"},
+    {"SELECT * FROM users WHERE name = 'o\\'brien' AND id = 1", NULL, "SELECT * FROM users WHERE name = ? AND id = ?"},
+    {"SELECT * FROM t WHERE b = X'DEADBEEF' AND s = N'uni' AND u = U&'d\\0061t' AND e = e'x'", NULL, "SELECT * FROM t WHERE b = ? AND s = ? AND u = ? AND e = ?"},
+    {"SELECT * FROM t WHERE a LIKE'%secret%'", NULL, "SELECT * FROM t WHERE a LIKE?"},
+    {"SELECT * FROM t WHERE f = 0x1F AND b = 0b101 AND n = 3e10 AND m = 1.5E-3 AND k = .5", NULL, "SELECT * FROM t WHERE f = ? AND b = ? AND n = ? AND m = ? AND k = ?"},
+    {"SELECT e, t.col, 1e5e FROM t", NULL, "SELECT e, t.col, 1e5e FROM t"},
+    {"SELECT \"user id\" FROM t WHERE token = \"abc123secret\"", "mysql", "SELECT ? FROM t WHERE token = ?"},
+    {"SELECT \"user id\" FROM t WHERE token = \"abc123secret\"", "MariaDB", "SELECT ? FROM t WHERE token = ?"},
+    {"SELECT \"user id\" FROM t WHERE token = \"abc123secret\"", "postgresql", "SELECT \"user id\" FROM t WHERE token = \"abc123secret\""},
+    {"SELECT \"user id\" FROM t WHERE token = \"abc123secret\"", NULL, "SELECT \"user id\" FROM t WHERE token = \"abc123secret\""},
+    {"SELECT * FROM t WHERE a = 'x' AND b = 9", NULL, "SELECT * FROM t WHERE a = ? AND b = ?"},
+    {"SELECT * FROM t WHERE a = ? AND b = ?", NULL, "SELECT * FROM t WHERE a = ? AND b = ?"},
+    {"SELECT * FROM t WHERE path = 'C:\\\\dir\\\\' AND n = 5", NULL, "SELECT * FROM t WHERE path = ? AND n = ?"},
+    {"INSERT INTO t (a, b) VALUES (-5, +3.25e+2)", NULL, "INSERT INTO t (a, b) VALUES (-?, +?)"},
+    {"SELECT * FROM t WHERE a = 'secret\\", NULL, "SELECT * FROM t WHERE a = ?"},
+    {"SELECT * FROM t WHERE a = \"secret\\", "mysql", "SELECT * FROM t WHERE a = ?"},
+};
+
+static void assert_masks_for_system_to(const char *input, const char *system, const char *expected) {
+  char *masked = system == NULL ? forgeops_sql_mask(input) : forgeops_sql_mask_for_system(input, system);
+  if (masked == NULL || strcmp(masked, expected) != 0) {
+    printf("  mask(%s, %s) = %s, expected %s\n", input, system == NULL ? "NULL" : system, masked == NULL ? "(null)" : masked, expected);
+    g_current_test_failed = 1;
+  }
+  free(masked);
+}
+
+TEST(sql_mask_matches_the_shared_corpus_exactly_and_is_idempotent_on_it) {
+  for (size_t i = 0; i < sizeof(sql_mask_corpus) / sizeof(sql_mask_corpus[0]); i++) {
+    assert_masks_for_system_to(sql_mask_corpus[i].input, sql_mask_corpus[i].system, sql_mask_corpus[i].expected);
+    assert_masks_for_system_to(sql_mask_corpus[i].expected, sql_mask_corpus[i].system, sql_mask_corpus[i].expected);
+  }
+}
+
+TEST(sql_mask_for_system_only_masks_double_quotes_for_mysql_and_mariadb) {
+  assert_masks_for_system_to("SELECT \"a\" FROM t", "MYSQL", "SELECT ? FROM t");
+  assert_masks_for_system_to("SELECT \"a\" FROM t", "mariadb", "SELECT ? FROM t");
+  assert_masks_for_system_to("SELECT \"a\" FROM t", "sqlite", "SELECT \"a\" FROM t");
+  char *masked = forgeops_sql_mask_for_system("SELECT \"a\" FROM t", NULL);
+  ASSERT_TRUE(masked != NULL && strcmp(masked, "SELECT \"a\" FROM t") == 0);
+  free(masked);
+  ASSERT_TRUE(forgeops_sql_mask_for_system(NULL, "mysql") == NULL);
+  ASSERT_TRUE(forgeops_sql_mask_for_system(" ", "mysql") == NULL);
+}
+
 TEST(sql_objects_finds_a_stored_procedure_with_its_schema) {
   assert_objects_are("EXEC dbo.sp_refund_order @id = ?", "{\"operation\":\"EXEC\",\"procedures\":[\"dbo.sp_refund_order\"],\"relations\":[]}");
   assert_objects_are("CALL refund_order(?, ?)", "{\"operation\":\"CALL\",\"procedures\":[\"refund_order\"],\"relations\":[]}");
@@ -2552,6 +2641,8 @@ int main(void) {
   RUN(sql_mask_replaces_strings_and_numbers_but_not_identifiers_or_placeholders);
   RUN(sql_mask_handles_an_escaped_quote_a_cut_off_string_and_a_dollar_quoted_body);
   RUN(sql_mask_is_idempotent_truncates_and_returns_null_for_blank);
+  RUN(sql_mask_matches_the_shared_corpus_exactly_and_is_idempotent_on_it);
+  RUN(sql_mask_for_system_only_masks_double_quotes_for_mysql_and_mariadb);
   RUN(sql_objects_finds_a_stored_procedure_with_its_schema);
   RUN(sql_objects_finds_views_joined_tables_and_table_functions);
   RUN(sql_objects_does_not_misread_column_lists_builtins_or_from_inside_extract);
@@ -2638,6 +2729,7 @@ int main(void) {
   RUN(tracing_a_slow_trace_is_delivered_to_spans_with_nested_spans_and_the_wire_shape);
   RUN(tracing_an_unknown_or_null_kind_is_sent_as_other_since_the_server_would_reject_the_whole_trace);
   RUN(tracing_a_database_span_sends_its_statement_masked_as_db_statement_with_db_system);
+  RUN(tracing_a_mysql_or_mariadb_span_masks_double_quoted_strings_too);
   RUN(tracing_a_database_statement_is_cut_at_4000_characters);
   RUN(tracing_a_trace_under_the_threshold_is_never_queued_and_leaves_nothing_open);
   RUN(tracing_track_tracing_off_still_has_a_trace_id_but_never_sends_and_reporting_disabled_starts_nothing);

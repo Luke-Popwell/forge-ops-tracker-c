@@ -18,29 +18,111 @@ static int is_word(unsigned char c) { return c == '_' || isalnum(c) != 0; }
 static int is_digit_char(unsigned char c) { return c >= '0' && c <= '9'; }
 static int is_alpha_char(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 static int is_space_char(unsigned char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+static int is_hex_char(unsigned char c) { return is_digit_char(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+static int is_binary_char(unsigned char c) { return c == '0' || c == '1'; }
 
-/* Where the number starting at i ends, or -1 when it isn't a standalone number (digits immediately
- * followed by a letter or underscore). A decimal that fails that check falls back to just its
- * integer part, the same way the shared pattern's backtracking does. */
-static long number_end(const char *s, size_t len, size_t i) {
-  size_t k = i;
-  while (k < len && is_digit_char((unsigned char)s[k])) k++;
-  size_t int_end = k;
-  if (k + 1 < len && s[k] == '.' && is_digit_char((unsigned char)s[k + 1])) {
-    size_t m = k + 1;
-    while (m < len && is_digit_char((unsigned char)s[m])) m++;
-    if (m >= len || !is_word((unsigned char)s[m])) return (long)m;
+/* Where the opening quote is when a string literal starts at i, or -1: the quote itself, or the one
+ * right after an E, X, N, B or U& prefix. The prefix only counts when it isn't the end of a longer
+ * word, but a quote always starts a string, so LIKE'%x%' is still masked (to LIKE?). */
+static long string_quote(const char *s, size_t len, size_t i) {
+  if (s[i] == '\'') return (long)i;
+  if (i > 0 && (is_word((unsigned char)s[i - 1]) || s[i - 1] == '$')) return -1;
+  size_t quote;
+  if (strchr("EeXxNnBb", s[i]) != NULL) {
+    quote = i + 1;
+  } else if ((s[i] == 'U' || s[i] == 'u') && i + 1 < len && s[i + 1] == '&') {
+    quote = i + 2;
+  } else {
+    return -1;
   }
-  if (int_end >= len || !is_word((unsigned char)s[int_end])) return (long)int_end;
+  return quote < len && s[quote] == '\'' ? (long)quote : -1;
+}
+
+/* Where the text opened by the quote at `open` ends: a backslash escapes the next character and a
+ * doubled quote is one quote. Without a closing quote (a string cut off by truncation, even right
+ * after a backslash) it runs to the end of the statement. */
+static size_t quoted_end(const char *s, size_t len, size_t open) {
+  char quote = s[open];
+  size_t j = open + 1;
+  while (j < len) {
+    if (s[j] == '\\') {
+      j += 2;
+    } else if (s[j] == quote) {
+      if (j + 1 >= len || s[j + 1] != quote) return j + 1;
+      j += 2;
+    } else {
+      j++;
+    }
+  }
+  return len;
+}
+
+static size_t digits_end(const char *s, size_t len, size_t k) {
+  while (k < len && is_digit_char((unsigned char)s[k])) k++;
+  return k;
+}
+
+/* Where the fraction (.5) starting at `dot` ends, or -1 when there isn't one. */
+static long fraction_end(const char *s, size_t len, size_t dot) {
+  if (dot + 1 < len && s[dot] == '.' && is_digit_char((unsigned char)s[dot + 1])) return (long)digits_end(s, len, dot + 1);
   return -1;
 }
 
-char *forgeops_sql_mask(const char *statement) {
+/* Where the exponent (e10, E-3, e+2) starting at i ends, or -1 when there isn't one. */
+static long exponent_end(const char *s, size_t len, size_t i) {
+  if (i >= len || (s[i] != 'e' && s[i] != 'E')) return -1;
+  size_t k = i + 1;
+  if (k < len && (s[k] == '+' || s[k] == '-')) k++;
+  size_t end = digits_end(s, len, k);
+  return end > k ? (long)end : -1;
+}
+
+static int ends_here(const char *s, size_t len, size_t k) { return k >= len || !is_word((unsigned char)s[k]); }
+
+/* Where the number starting at i ends, or -1 when it isn't a standalone number (immediately
+ * followed by a letter, digit or underscore). Hex (0x1F) and binary (0b101) first, then a decimal
+ * (42, 1.5, .5) with an optional exponent (3e10, 1.5E-3). One that fails that check falls back to a
+ * shorter reading, the same way the shared pattern's backtracking does: 1.5x masks just the 1. */
+static long number_end(const char *s, size_t len, size_t i) {
+  if (s[i] == '0' && i + 1 < len) {
+    int (*radix_digit)(unsigned char) = NULL;
+    if (s[i + 1] == 'x' || s[i + 1] == 'X') radix_digit = is_hex_char;
+    if (s[i + 1] == 'b' || s[i + 1] == 'B') radix_digit = is_binary_char;
+    if (radix_digit != NULL) {
+      size_t k = i + 2;
+      while (k < len && radix_digit((unsigned char)s[k])) k++;
+      if (k > i + 2 && ends_here(s, len, k)) return (long)k;
+    }
+  }
+
+  /* Longest reading first: with the fraction, then without. */
+  size_t int_end = digits_end(s, len, i);
+  long mantissas[2];
+  if (int_end > i) {
+    mantissas[0] = fraction_end(s, len, int_end);
+    mantissas[1] = (long)int_end;
+  } else {
+    mantissas[0] = fraction_end(s, len, i);
+    mantissas[1] = -1;
+  }
+  for (int m = 0; m < 2; m++) {
+    if (mantissas[m] < 0) continue;
+    long exponent = exponent_end(s, len, (size_t)mantissas[m]);
+    if (exponent >= 0 && ends_here(s, len, (size_t)exponent)) return exponent;
+    if (ends_here(s, len, (size_t)mantissas[m])) return mantissas[m];
+  }
+  return -1;
+}
+
+char *forgeops_sql_mask(const char *statement) { return forgeops_sql_mask_for_system(statement, NULL); }
+
+char *forgeops_sql_mask_for_system(const char *statement, const char *db_system) {
   if (statement == NULL) return NULL;
   size_t len = strlen(statement);
   size_t first = 0;
   while (first < len && is_space_char((unsigned char)statement[first])) first++;
   if (first == len) return NULL;
+  int double_quoted_strings = db_system != NULL && (strcasecmp(db_system, "mysql") == 0 || strcasecmp(db_system, "mariadb") == 0);
 
   forgeops_strbuf_t out;
   if (forgeops_strbuf_init(&out, len + 8) != 0) return NULL;
@@ -49,23 +131,14 @@ char *forgeops_sql_mask(const char *statement) {
   size_t i = 0;
   while (i < len) {
     unsigned char c = (unsigned char)s[i];
-    if (c == '\'') {
-      /* A string literal; '' is an escaped quote. One cut off by truncation (no closing quote) is
-       * masked to the end of the statement, never left half-visible. */
-      size_t j = i + 1;
-      while (j < len) {
-        if (s[j] == '\'') {
-          if (j + 1 < len && s[j + 1] == '\'') {
-            j += 2;
-            continue;
-          }
-          j++;
-          break;
-        }
-        j++;
-      }
+    /* A string literal, with its E/X/N/B/U& prefix if it has one. '' is an escaped quote and so is
+     * \', and one cut off by truncation (no closing quote) is masked to the end of the statement,
+     * never left half-visible. In MySQL and MariaDB "double quoted" text is a string too. */
+    long quote = string_quote(s, len, i);
+    if (quote < 0 && double_quoted_strings && c == '"') quote = (long)i;
+    if (quote >= 0) {
       forgeops_strbuf_append_str(&out, SQL_MASK);
-      i = j;
+      i = quoted_end(s, len, (size_t)quote);
     } else if (c == '$') {
       /* A dollar-quoted body ($tag$ ... $tag$): PostgreSQL function bodies and DO blocks. */
       size_t j = i + 1;
@@ -85,7 +158,7 @@ char *forgeops_sql_mask(const char *statement) {
         forgeops_strbuf_append(&out, s + i, 1);
         i++;
       }
-    } else if (is_digit_char(c)) {
+    } else if (is_digit_char(c) || c == '.') {
       /* A number, unless it's part of an identifier (orders2, sp_v2), a $1 placeholder, or the
        * fraction of another number; those digits are left alone. */
       int part_of_something = i > 0 && (is_word((unsigned char)s[i - 1]) || s[i - 1] == '$' || s[i - 1] == '.');
