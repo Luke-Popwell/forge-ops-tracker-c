@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -18,6 +19,8 @@
 
 static forgeops_configuration_t *shared_configuration = NULL;
 static int handlers_installed = 0;
+static atomic_int environment_warning_given = 0;
+static atomic_int upload_atexit_registered = 0;
 
 typedef struct {
   char **keys;
@@ -48,11 +51,60 @@ forgeops_configuration_t *forgeops_tracker_configuration(void) {
   return shared_configuration;
 }
 
+static int environment_is_enabled(const forgeops_configuration_t *config) {
+  if (config->environment == NULL) return 0;
+  for (int i = 0; i < config->enabled_environment_count; i++) {
+    if (config->enabled_environments[i] != NULL && strcmp(config->environment, config->enabled_environments[i]) == 0) return 1;
+  }
+  return 0;
+}
+
+/* Says once per process, on stderr (this SDK has no logger of its own), when a DSN is set but the
+ * environment isn't one that sends, which otherwise looks exactly like a broken setup: every
+ * capture a silent no-op. Checked at every public entry point rather than at one "init", since the
+ * configuration is a plain struct the caller can keep editing until the first real call. */
+static void warn_once_if_environment_is_not_enabled(const forgeops_configuration_t *config) {
+  if (config == NULL || config->dsn == NULL || config->dsn[0] == '\0') return;
+  if (atomic_load(&environment_warning_given) || environment_is_enabled(config)) return;
+  if (atomic_exchange(&environment_warning_given, 1)) return;
+
+  forgeops_strbuf_t enabled;
+  if (forgeops_strbuf_init(&enabled, 64) != 0) return;
+  for (int i = 0; i < config->enabled_environment_count; i++) {
+    if (config->enabled_environments[i] == NULL) continue;
+    if (enabled.length > 0) forgeops_strbuf_append_str(&enabled, ", ");
+    forgeops_strbuf_append_str(&enabled, config->enabled_environments[i]);
+  }
+  const char *environment = config->environment != NULL ? config->environment : "";
+  fprintf(stderr,
+          "[ForgeOps] Not sending: this environment is \"%s\", and only %s are enabled. Set FORGE_OPS_ENVIRONMENT=production (or add \"%s\" to the enabled environments) to send from here.\n",
+          environment, enabled.data != NULL ? enabled.data : "", environment);
+  free(enabled.data);
+}
+
+/* The shared configuration, after the one-time environment warning check: what every public call
+ * that captures or sends goes through. */
+static forgeops_configuration_t *active_configuration(void) {
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  warn_once_if_environment_is_not_enabled(config);
+  return config;
+}
+
+/* An explicit capture is written to disk first (so a crash right after it still loses nothing),
+ * then uploaded by the next forgeops_tracker_flush / forgeops_tracker_upload_pending_reports call or,
+ * failing that, here at a normal exit, so a program that captures one error and returns from main
+ * still delivers it on its first run. Stops at the first failed delivery: an exit with the network
+ * down waits for one timeout, and whatever is left goes up on the next run. */
+static void upload_at_exit(void) {
+  if (shared_configuration == NULL) return;
+  forgeops_upload_pending_reports_until_failure(shared_configuration, 1);
+}
+
 void forgeops_tracker_install_handlers(void) {
   if (handlers_installed) return;
   handlers_installed = 1;
 
-  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_t *config = active_configuration();
   forgeops_signal_handler_install(config->crash_reports_directory);
   forgeops_tracker_upload_pending_reports();
 }
@@ -65,9 +117,13 @@ void forgeops_tracker_capture_error_with_sql(const char *exception_class, const 
   if (user_count == 0) {
     forgeops_tracker_current_user(&user_keys, &user_values, &user_count);
   }
+  forgeops_configuration_t *config = active_configuration();
+  if (forgeops_configuration_is_enabled(config) && !atomic_exchange(&upload_atexit_registered, 1)) {
+    atexit(upload_at_exit);
+  }
   size_t breadcrumb_count = 0;
   char **breadcrumbs = forgeops_breadcrumbs_snapshot(&breadcrumb_count);
-  forgeops_report_error_with_sql(forgeops_tracker_configuration(), exception_class, message, context_keys, context_values, context_count, user_keys, user_values, user_count, (const char **)breadcrumbs, breadcrumb_count, sql);
+  forgeops_report_error_with_sql(config, exception_class, message, context_keys, context_values, context_count, user_keys, user_values, user_count, (const char **)breadcrumbs, breadcrumb_count, sql);
   forgeops_breadcrumbs_free_snapshot(breadcrumbs, breadcrumb_count);
 }
 
@@ -103,7 +159,7 @@ void forgeops_tracker_current_user(const char ***out_keys, const char ***out_val
 }
 
 void forgeops_tracker_record_performance(const char *transaction_name, double duration_ms) {
-  forgeops_performance_record(forgeops_tracker_configuration(), transaction_name, duration_ms);
+  forgeops_performance_record(active_configuration(), transaction_name, duration_ms);
 }
 
 static long long monotonic_now_ns(void) {
@@ -139,7 +195,7 @@ forgeops_trace_t forgeops_tracker_trace_start(void) {
 
 forgeops_trace_t forgeops_tracker_trace_start_with_traceparent(const char *traceparent) {
   forgeops_trace_t trace = {wall_clock_ms(), monotonic_now_ns(), 0};
-  trace.owns = forgeops_spans_trace_begin(forgeops_tracker_configuration(), traceparent);
+  trace.owns = forgeops_spans_trace_begin(active_configuration(), traceparent);
   return trace;
 }
 
@@ -297,7 +353,7 @@ static void append_json_string(forgeops_strbuf_t *out, const char *value) {
 }
 
 void forgeops_tracker_capture_metric(const char *name, double value) {
-  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_t *config = active_configuration();
   if (name == NULL || !forgeops_configuration_is_enabled(config) || !isfinite(value)) return;
 
   forgeops_strbuf_t fields;
@@ -321,7 +377,7 @@ void forgeops_tracker_capture_metric(const char *name, double value) {
 }
 
 void forgeops_tracker_capture_infrastructure_metric(const char *name, double value, const char *hostname) {
-  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_t *config = active_configuration();
   if (name == NULL || !forgeops_configuration_is_enabled(config) || !isfinite(value)) return;
 
   forgeops_strbuf_t fields;
@@ -349,13 +405,21 @@ void forgeops_tracker_record_change(const char *kind, const char *title, const c
 }
 
 void forgeops_tracker_record_change_with_options(const char *kind, const char *title, const char **details_keys, const char **details_values, size_t details_count, const forgeops_change_options_t *options) {
-  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_t *config = active_configuration();
   if (!forgeops_configuration_is_enabled(config)) return;
   forgeops_changes_enqueue(config, forgeops_changes_build(config, kind, title, details_keys, details_values, details_count, options));
 }
 
 void forgeops_tracker_upload_pending_reports(void) {
-  forgeops_upload_pending_reports(forgeops_tracker_configuration());
+  forgeops_upload_pending_reports(active_configuration());
+}
+
+void forgeops_tracker_flush(void) {
+  forgeops_configuration_t *config = active_configuration();
+  forgeops_upload_pending_reports(config);
+  forgeops_performance_flush(config);
+  forgeops_metrics_flush(config, FORGEOPS_METRIC_CUSTOM);
+  forgeops_metrics_flush(config, FORGEOPS_METRIC_INFRASTRUCTURE);
 }
 
 void forgeops_tracker_reset_for_testing(void) {
@@ -366,6 +430,7 @@ void forgeops_tracker_reset_for_testing(void) {
   forgeops_configuration_destroy(shared_configuration);
   shared_configuration = NULL;
   handlers_installed = 0;
+  atomic_store(&environment_warning_given, 0);
   free_current_user();
   forgeops_breadcrumbs_reset_for_testing();
   /* Deliberately not touching the real signal dispositions here: resetting those between test

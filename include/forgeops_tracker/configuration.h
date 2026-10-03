@@ -14,7 +14,7 @@
  */
 typedef struct {
   char *dsn;                       /* NULL if unset */
-  char *environment;               /* never NULL: defaults to "development" */
+  char *environment;               /* never NULL: FORGE_OPS_ENVIRONMENT, else "production" */
   char *release;                   /* NULL if unset */
   char *server_name;               /* NULL if the hostname lookup failed */
   char *crash_reports_directory;   /* never NULL: see forgeops_configuration_create */

@@ -35,4 +35,9 @@ void forgeops_report_error_with_sql(const forgeops_configuration_t *config, cons
  */
 void forgeops_upload_pending_reports(const forgeops_configuration_t *config);
 
+/* The same, but with stop_at_first_failure set, the first failed delivery ends the pass (leaving
+ * that report and every later one for the next attempt): what the atexit upload uses, so a process
+ * exiting while the network is down waits for one timeout rather than one per pending report. */
+void forgeops_upload_pending_reports_until_failure(const forgeops_configuration_t *config, int stop_at_first_failure);
+
 #endif

@@ -30,6 +30,10 @@ void forgeops_report_error_with_sql(const forgeops_configuration_t *config, cons
 }
 
 void forgeops_upload_pending_reports(const forgeops_configuration_t *config) {
+  forgeops_upload_pending_reports_until_failure(config, 0);
+}
+
+void forgeops_upload_pending_reports_until_failure(const forgeops_configuration_t *config, int stop_at_first_failure) {
   if (!forgeops_configuration_is_enabled(config)) return;
 
   char **paths = forgeops_crash_store_pending_paths(config);
@@ -52,11 +56,13 @@ void forgeops_upload_pending_reports(const forgeops_configuration_t *config) {
       continue;
     }
 
-    if (forgeops_client_deliver(config, payload)) {
+    int delivered = forgeops_client_deliver(config, payload);
+    if (delivered) {
       forgeops_crash_store_delete(*p);
     }
     /* On failure, leave it in place; the next call retries it. */
     free(payload);
+    if (!delivered && stop_at_first_failure) break;
   }
 
   forgeops_crash_store_free_paths(paths);

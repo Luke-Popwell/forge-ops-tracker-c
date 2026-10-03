@@ -6,6 +6,7 @@
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,12 +83,39 @@ static int g_current_test_failed = 0;
 TEST(configuration_defaults) {
   forgeops_configuration_t *config = forgeops_configuration_create();
   ASSERT_NOT_NULL(config);
-  ASSERT_STREQ(config->environment, "development");
+  ASSERT_STREQ(config->environment, "production");
   ASSERT_TRUE(config->scrub_pii == 1);
   ASSERT_TRUE(config->capture_source_context == 1);
   ASSERT_TRUE(config->timeout_seconds > 0);
   ASSERT_TRUE(config->enabled_environment_count == 2);
   forgeops_configuration_destroy(config);
+}
+
+TEST(configuration_environment_is_forge_ops_environment_else_production) {
+  const char *saved = getenv("FORGE_OPS_ENVIRONMENT");
+  char *saved_copy = saved != NULL ? strdup(saved) : NULL;
+
+  setenv("FORGE_OPS_ENVIRONMENT", "staging", 1);
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  ASSERT_STREQ(config->environment, "staging");
+  forgeops_configuration_destroy(config);
+
+  setenv("FORGE_OPS_ENVIRONMENT", "", 1); /* blank counts as unset */
+  config = forgeops_configuration_create();
+  ASSERT_STREQ(config->environment, "production");
+  forgeops_configuration_destroy(config);
+
+  unsetenv("FORGE_OPS_ENVIRONMENT");
+  config = forgeops_configuration_create();
+  ASSERT_STREQ(config->environment, "production");
+  ASSERT_STREQ(config->enabled_environments[0], "production");
+  ASSERT_STREQ(config->enabled_environments[1], "staging");
+  forgeops_configuration_destroy(config);
+
+  if (saved_copy != NULL) {
+    setenv("FORGE_OPS_ENVIRONMENT", saved_copy, 1);
+    free(saved_copy);
+  }
 }
 
 TEST(configuration_api_key_and_ingestion_url) {
@@ -2528,7 +2556,7 @@ TEST(changes_build_defaults_environment_and_occurred_at_and_leaves_unset_keys_ou
   forgeops_configuration_t *config = forgeops_configuration_create();
   char *body = forgeops_changes_build(config, "config", "  Raised the upload limit\n", NULL, NULL, 0, NULL);
   ASSERT_NOT_NULL(body);
-  ASSERT_TRUE(strncmp(body, "{\"kind\":\"config\",\"title\":\"Raised the upload limit\",\"environment\":\"development\",\"occurred_at\":\"20", 95) == 0);
+  ASSERT_TRUE(strncmp(body, "{\"kind\":\"config\",\"title\":\"Raised the upload limit\",\"environment\":\"production\",\"occurred_at\":\"20", 94) == 0);
   ASSERT_TRUE(strstr(body, "Z\"}") != NULL && body[strlen(body) - 1] == '}');
   ASSERT_TRUE(strstr(body, "details") == NULL && strstr(body, "service") == NULL && strstr(body, "actor") == NULL && strstr(body, "\"url\"") == NULL && strstr(body, "\"id\"") == NULL);
   free(body);
@@ -2637,6 +2665,162 @@ TEST(changes_record_change_never_fails_the_caller_on_a_403_or_an_unreachable_hos
   ASSERT_TRUE(1);
 }
 
+/* ---- Environment warning, flush, and the exit-time upload ------------------------------------------ */
+
+/* Runs body with stderr pointed at a temp file and returns what was written (caller frees). */
+static char *capture_stderr(void (*body)(void)) {
+  char path[128];
+  snprintf(path, sizeof(path), "/tmp/forgeops-c-stderr-%d.txt", getpid());
+  fflush(stderr);
+  int saved = dup(fileno(stderr));
+  FILE *f = fopen(path, "w");
+  if (f == NULL) return NULL;
+  dup2(fileno(f), fileno(stderr));
+  body();
+  fflush(stderr);
+  dup2(saved, fileno(stderr));
+  close(saved);
+  fclose(f);
+  char *contents = read_whole_file(path);
+  remove(path);
+  return contents;
+}
+
+static int count_occurrences(const char *haystack, const char *needle) {
+  int count = 0;
+  for (const char *p = haystack; (p = strstr(p, needle)) != NULL; p += strlen(needle)) count++;
+  return count;
+}
+
+static char warning_test_dir[256];
+
+static forgeops_configuration_t *warning_test_setup(const char *dsn, const char *environment) {
+  forgeops_tracker_reset_for_testing();
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_set_dsn(config, dsn);
+  free(config->environment);
+  config->environment = strdup(environment);
+  free(config->crash_reports_directory);
+  snprintf(warning_test_dir, sizeof(warning_test_dir), "/tmp/forgeops-c-warning-tests-%d", getpid());
+  config->crash_reports_directory = strdup(warning_test_dir);
+  config->timeout_seconds = 1;
+  return config;
+}
+
+static void capture_twice_in_development(void) {
+  warning_test_setup("http://key@127.0.0.1:1/events", "development");
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
+  forgeops_tracker_capture_metric("queue.depth", 3);
+  forgeops_tracker_record_performance("GET /", 1.0);
+  forgeops_tracker_capture_error("Boom", "again", NULL, NULL, 0, NULL, NULL, 0);
+}
+
+static void capture_without_a_dsn(void) {
+  forgeops_tracker_reset_for_testing();
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_set_dsn(config, NULL);
+  free(config->environment);
+  config->environment = strdup("development");
+  forgeops_tracker_capture_error("Boom", "bad", NULL, NULL, 0, NULL, NULL, 0);
+  forgeops_tracker_flush();
+}
+
+static void capture_in_staging(void) {
+  warning_test_setup("http://key@127.0.0.1:1/events", "staging");
+  forgeops_tracker_install_handlers();
+  forgeops_tracker_capture_metric("queue.depth", 3);
+}
+
+TEST(tracker_warns_once_on_stderr_when_a_dsn_is_set_but_the_environment_does_not_send) {
+  char *out = capture_stderr(capture_twice_in_development);
+  ASSERT_NOT_NULL(out);
+  ASSERT_TRUE(count_occurrences(out, "[ForgeOps]") == 1);
+  ASSERT_TRUE(strstr(out, "[ForgeOps] Not sending: this environment is \"development\", and only production, staging are enabled. Set FORGE_OPS_ENVIRONMENT=production (or add \"development\" to the enabled environments) to send from here.\n") != NULL);
+  ASSERT_NULL(forgeops_crash_store_pending_paths(forgeops_tracker_configuration()));
+  free(out);
+  remove_directory_recursive(warning_test_dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracker_never_warns_without_a_dsn_or_in_an_environment_that_sends) {
+  char *out = capture_stderr(capture_without_a_dsn);
+  ASSERT_NOT_NULL(out);
+  ASSERT_TRUE(strstr(out, "[ForgeOps]") == NULL);
+  free(out);
+
+  out = capture_stderr(capture_in_staging);
+  ASSERT_NOT_NULL(out);
+  ASSERT_TRUE(strstr(out, "[ForgeOps]") == NULL);
+  free(out);
+  remove_directory_recursive(warning_test_dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracker_flush_uploads_an_explicit_capture_straight_away) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-flush-body-%d.json", getpid());
+  pid_t server;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &server);
+
+  char dsn[256];
+  snprintf(dsn, sizeof(dsn), "http://key@127.0.0.1:%d/api/v1/events", port);
+  forgeops_configuration_t *config = warning_test_setup(dsn, "production");
+  forgeops_tracker_capture_error("ForgeOpsTestError", "Hello from the C SDK", NULL, NULL, 0, NULL, NULL, 0);
+  forgeops_tracker_flush();
+
+  ASSERT_NULL(forgeops_crash_store_pending_paths(config));
+  waitpid(server, NULL, 0);
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"exception_class\":\"ForgeOpsTestError\"") != NULL);
+  free(body);
+  remove(body_path);
+  remove_directory_recursive(warning_test_dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(tracker_a_program_that_captures_an_error_and_returns_from_main_delivers_it_on_its_first_run) {
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+  /* See metrics_a_program_that_captures_a_reading_and_just_exits_still_delivers_it_from_its_atexit_hook:
+   * TSan's fork() support hangs a forked child of a process that has run threads. */
+  return;
+#endif
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-exit-body-%d.json", getpid());
+  pid_t server;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &server);
+
+  char dsn[256];
+  snprintf(dsn, sizeof(dsn), "http://key@127.0.0.1:%d/api/v1/events", port);
+  fflush(NULL);
+  pid_t child = fork();
+  if (child == 0) {
+    /* What the setup page's program does: configure, capture, return 0 (no flush, no upload call). */
+    warning_test_setup(dsn, "production");
+    forgeops_tracker_capture_error("ForgeOpsTestError", "sent at exit", NULL, NULL, 0, NULL, NULL, 0);
+    exit(0); /* not _exit: the atexit hook is the thing under test */
+  }
+  int status = 0;
+  waitpid(child, &status, 0);
+  /* The child has exited, so whatever it was going to send has been sent: give the server a moment
+   * to write it out, then stop it, so a missing delivery fails this test instead of hanging it. */
+  for (int waited_ms = 0; waited_ms < 3000 && waitpid(server, NULL, WNOHANG) == 0; waited_ms += 50) {
+    usleep(50 * 1000);
+  }
+  kill(server, SIGKILL);
+  waitpid(server, NULL, 0);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"message\":\"sent at exit\"") != NULL);
+  free(body);
+  remove(body_path);
+  remove_directory_recursive(warning_test_dir);
+}
+
 int main(void) {
   RUN(sql_mask_replaces_strings_and_numbers_but_not_identifiers_or_placeholders);
   RUN(sql_mask_handles_an_escaped_quote_a_cut_off_string_and_a_dollar_quoted_body);
@@ -2648,6 +2832,7 @@ int main(void) {
   RUN(sql_objects_does_not_misread_column_lists_builtins_or_from_inside_extract);
   RUN(sql_event_builder_sends_the_procedure_name_by_default_and_the_statement_only_when_opted_in);
   RUN(configuration_defaults);
+  RUN(configuration_environment_is_forge_ops_environment_else_production);
   RUN(configuration_api_key_and_ingestion_url);
   RUN(configuration_api_key_percent_decodes);
   RUN(configuration_empty_or_malformed_dsn);
@@ -2772,6 +2957,11 @@ int main(void) {
   RUN(changes_escape_quotes_and_control_characters_into_valid_json);
   RUN(changes_record_change_delivers_to_the_changes_endpoint_and_is_a_no_op_when_disabled);
   RUN(changes_record_change_never_fails_the_caller_on_a_403_or_an_unreachable_host);
+
+  RUN(tracker_warns_once_on_stderr_when_a_dsn_is_set_but_the_environment_does_not_send);
+  RUN(tracker_never_warns_without_a_dsn_or_in_an_environment_that_sends);
+  RUN(tracker_flush_uploads_an_explicit_capture_straight_away);
+  RUN(tracker_a_program_that_captures_an_error_and_returns_from_main_delivers_it_on_its_first_run);
 
   printf("\n%d run, %d failed\n", g_tests_run, g_tests_failed);
   return g_tests_failed == 0 ? 0 : 1;

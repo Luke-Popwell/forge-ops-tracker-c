@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0 (2026-10-02)
+
+- **Behavior change: the default environment is now `"production"`, not `"development"`.** It is `FORGE_OPS_ENVIRONMENT` when that is set, else `"production"`. A program that sets a DSN and nothing else now sends, where before every capture was silently dropped. If you relied on the old default to keep a development machine quiet, set `FORGE_OPS_ENVIRONMENT=development` there (or leave the DSN unset). The enabled environments are unchanged: `production` and `staging`.
+- With a DSN set and an environment that isn't enabled, the first SDK call now prints one line to stderr, once per process: `[ForgeOps] Not sending: this environment is "development", and only production, staging are enabled. Set FORGE_OPS_ENVIRONMENT=production (or add "development" to the enabled environments) to send from here.` Nothing is printed without a DSN.
+- **Behavior change: an explicit `forgeops_tracker_capture_error` is now uploaded on the run that captured it.** It is still written to disk first, so a crash right after it loses nothing, but a normal exit (returning from `main`, or `exit`) now uploads it from an `atexit` hook instead of leaving it for the next launch. That hook stops at the first failed delivery, so an exit with the network down waits for one timeout at most, and the rest goes up on the next run as before. Fatal-signal crash reports are unchanged: they still go up from `forgeops_tracker_install_handlers()` on the next launch.
+- New `forgeops_tracker_flush()` sends everything waiting, synchronously: pending error reports, then performance samples and both metric buffers. The README quick-start is now a complete program (configure, capture, flush) that shows up in ForgeOps on its first run.
+- New `forgeops_upload_pending_reports_until_failure(config, stop_at_first_failure)` in `forgeops_tracker/reporter.h`, the lower-level form the exit hook uses.
+
 ## 0.7.0 (2026-09-29)
 
 - SQL masking now catches values it used to let through, matching ForgeOps's own masker again: a string with a backslash-escaped quote (`'o\'brien'`, `E'o\'brien'`) is masked whole instead of leaving the rest of it visible, a string's type prefix goes with it (`E''`, `X''`, `N''`, `B''` and `U&''` each become one `?`), and hex (`0x1F`), binary (`0b101`), exponent (`3e10`, `1.5E-3`) and leading-dot (`.5`) numbers are masked. On a `database` span whose `db.system` is `mysql` or `mariadb`, "double quoted" text is a string and is masked too; on any other database it's a name and is still left alone. New `forgeops_sql_mask_for_system(statement, db_system)` in `forgeops_tracker/sql_statement.h` is that system-aware masker; `forgeops_sql_mask(statement)` keeps its signature and masks as it does with a `NULL` system.

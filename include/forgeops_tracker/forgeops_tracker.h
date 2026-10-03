@@ -14,6 +14,13 @@
  *     forgeops_configuration_t *config = forgeops_tracker_configuration();
  *     forgeops_configuration_set_dsn(config, "https://<api_key>@getforgeops.net/api/v1/events");
  *     forgeops_tracker_install_handlers();
+ *     ...
+ *     forgeops_tracker_capture_error("ChargeDeclined", "the card was declined", NULL, NULL, 0, NULL, NULL, 0);
+ *     forgeops_tracker_flush(); (or just return from main: an atexit hook uploads it too)
+ *
+ * The environment is FORGE_OPS_ENVIRONMENT, else "production"; only "production" and "staging"
+ * send by default. With a DSN set and any other environment, the first call prints one line to
+ * stderr saying nothing will be sent and how to change that.
  *
  * There's no configure-block style API here the way the higher-level clients in this repo have:
  * plain C has no closures to pass one as, so forgeops_tracker_configuration() just hands back the
@@ -24,7 +31,8 @@
  * signal, the only "automatic capture" story that exists for plain C: there's no equivalent to
  * an uncaught-exception hook, because C has no exceptions at all) and why a crash report always
  * uploads on the *next* call to forgeops_tracker_upload_pending_reports (typically your own next
- * startup) rather than live during the crash itself.
+ * startup) rather than live during the crash itself. An explicit capture is different: it is
+ * written to disk, then uploaded by forgeops_tracker_flush or, at the latest, at a normal exit.
  */
 
 forgeops_configuration_t *forgeops_tracker_configuration(void);
@@ -308,6 +316,16 @@ void forgeops_tracker_flush_metrics(void);
  */
 void forgeops_tracker_record_change(const char *kind, const char *title, const char **details_keys, const char **details_values, size_t details_count);
 void forgeops_tracker_record_change_with_options(const char *kind, const char *title, const char **details_keys, const char **details_values, size_t details_count, const forgeops_change_options_t *options);
+
+/*
+ * Sends everything this process has waiting, synchronously: every pending report (an explicit
+ * forgeops_tracker_capture_error that is on disk but not uploaded yet, or a past crash), then the
+ * performance buckets and both metric buffers. Call it after a capture you want delivered now,
+ * such as a test error from a setup check, or before an exit an atexit hook won't see (_exit, a
+ * signal). Without it, a normal exit uploads captured errors from an atexit hook anyway, stopping
+ * at the first failed delivery so an offline exit waits for one timeout at most.
+ */
+void forgeops_tracker_flush(void);
 
 /* Uploads every pending report (from a past crash, or a past forgeops_tracker_capture_error call
  * whose upload hasn't happened yet). Synchronous: call it from your own background thread if

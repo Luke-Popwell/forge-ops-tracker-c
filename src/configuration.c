@@ -33,7 +33,10 @@ forgeops_configuration_t *forgeops_configuration_create(void) {
   if (config == NULL) return NULL;
 
   config->dsn = dup_env_or("FORGE_OPS_DSN", NULL);
-  config->environment = dup_env_or("FORGE_OPS_ENVIRONMENT", "development");
+  /* FORGE_OPS_ENVIRONMENT, else "production": plain C has no platform-standard environment
+   * variable to fall back on, and a program that sets nothing is most likely the deployed one, so
+   * an unset environment sends rather than silently dropping everything. */
+  config->environment = dup_env_or("FORGE_OPS_ENVIRONMENT", "production");
   config->release = dup_env_or("FORGE_OPS_RELEASE", NULL);
   config->server_name = safe_hostname();
 

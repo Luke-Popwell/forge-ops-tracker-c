@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.7.0
+  GIT_TAG v0.8.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -56,22 +56,47 @@ POSIX only (verified on macOS; Linux/glibc should work identically: `<execinfo.h
 comment). Not Windows: no `<execinfo.h>`, no POSIX signal handling, no POSIX `<regex.h>` without
 extra tooling.
 
-## Configuration
+## Quick start
 
 Set a DSN (from a project's settings page in ForgeOps), either via the `FORGE_OPS_DSN` environment
 variable or explicitly. There's no configure-block API here: plain C has no closures to pass one
 as: so `forgeops_tracker_configuration()` just hands back the shared `Configuration` struct
-directly:
+directly. This whole program sends one test error and shows up in ForgeOps on its first run:
 
 ```c
 #include <forgeops_tracker/forgeops_tracker.h>
 
-forgeops_configuration_t *config = forgeops_tracker_configuration();
-forgeops_configuration_set_dsn(config, "https://<api_key>@getforgeops.net/api/v1/events");
-config->environment = "production"; /* a plain field write is fine for anything except dsn, which
-                                        needs forgeops_configuration_set_dsn to invalidate its own
-                                        cached parsing */
-forgeops_tracker_install_handlers();
+int main(void) {
+  forgeops_configuration_t *config = forgeops_tracker_configuration();
+  forgeops_configuration_set_dsn(config, "https://<api_key>@getforgeops.net/api/v1/events");
+  forgeops_tracker_install_handlers(); /* fatal signals, plus anything left from a previous run */
+
+  forgeops_tracker_capture_error("ForgeOpsTestError", "Hello from the C SDK", NULL, NULL, 0, NULL, NULL, 0);
+  forgeops_tracker_flush(); /* uploads it now */
+  return 0;
+}
+```
+
+`forgeops_tracker_capture_error` writes the report to disk first, so a crash straight after it
+still loses nothing, and `forgeops_tracker_flush()` uploads it (along with any buffered performance
+samples and metrics) before returning. Leave the flush out and a normal exit uploads it anyway, from
+an `atexit` hook. See "When a report is uploaded" below.
+
+### Environment
+
+The environment comes from `FORGE_OPS_ENVIRONMENT`, and is `"production"` when that isn't set.
+Only `production` and `staging` send by default. With a DSN set and any other environment, the
+first call prints one line to stderr and nothing is sent:
+
+```
+[ForgeOps] Not sending: this environment is "development", and only production, staging are enabled. Set FORGE_OPS_ENVIRONMENT=production (or add "development" to the enabled environments) to send from here.
+```
+
+To set it in code, replace the string (every field is heap-owned, so don't assign a literal):
+
+```c
+free(config->environment);
+config->environment = strdup("staging");
 ```
 
 ## What gets reported automatically, and what doesn't
@@ -414,22 +439,25 @@ It is a no-op when reporting isn't enabled for the environment. This client runs
 embedded targets as well as servers, so it sends no automatic startup snapshot; every change is one
 you record.
 
-## Why a report always uploads on the *next* call, not live during the error itself
+## When a report is uploaded
 
 A fatal signal means the process is about to terminate, possibly abnormally: there's no safe way
 to make a live network call from inside that handler. Instead, every report (crash or explicit) is
 written to disk first (`crash_store.c`, a small durable "queue" that survives the process dying,
-rather than held live in memory) and only actually sent over the network by
-`forgeops_tracker_upload_pending_reports()`: called once automatically by
-`forgeops_tracker_install_handlers()` (covering whatever crashed on a *previous* run), and safe to
-call again yourself whenever else makes sense for your app (a periodic timer; right after an
-explicit `forgeops_tracker_capture_error` call, since that case didn't just terminate the process
-and has no particular reason to wait). A failed upload leaves the file in place for the next call
-to retry.
+rather than held live in memory) and only then sent over the network:
 
-There is no background thread doing this automatically: plain C has no runtime event loop or
-built-in async story to hang one off of. If you want uploads to happen off your main thread, spawn
-one yourself (pthreads, or whatever your platform's own threading story is) and call
+- **A crash** goes up on the next run, from `forgeops_tracker_install_handlers()`, which uploads
+  whatever a previous run left behind.
+- **An explicit `forgeops_tracker_capture_error`** goes up at the next `forgeops_tracker_flush()` or
+  `forgeops_tracker_upload_pending_reports()` call, or at the latest from an `atexit` hook when the
+  program exits normally (returning from `main` or calling `exit`). The hook stops at the first
+  failed delivery, so an exit with the network down waits for one timeout at most; the rest stays
+  on disk for the next run. Call `forgeops_tracker_flush()` yourself before `_exit` or anything else
+  that skips `atexit` hooks.
+
+A failed upload leaves the file in place for the next call to retry. Uploads are synchronous: there
+is no background thread doing them, since plain C has no runtime event loop to hang one off of. If
+you want them off your main thread, spawn one yourself and call `forgeops_tracker_flush()` or
 `forgeops_tracker_upload_pending_reports()` from it.
 
 ## Backtrace frames: image + symbol, never file/line
