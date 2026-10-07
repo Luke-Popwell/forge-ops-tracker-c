@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1 (2026-10-07)
+
+- The library now ships its MIT licence (`LICENSE.txt`). Earlier versions were published without one. No code changes.
+
 ## 0.8.0 (2026-10-02)
 
 - **Behavior change: the default environment is now `"production"`, not `"development"`.** It is `FORGE_OPS_ENVIRONMENT` when that is set, else `"production"`. A program that sets a DSN and nothing else now sends, where before every capture was silently dropped. If you relied on the old default to keep a development machine quiet, set `FORGE_OPS_ENVIRONMENT=development` there (or leave the DSN unset). The enabled environments are unchanged: `production` and `staging`.
