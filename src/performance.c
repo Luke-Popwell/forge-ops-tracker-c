@@ -22,6 +22,7 @@ static bucket_t *buckets = NULL;
 static size_t bucket_count = 0;
 static size_t bucket_capacity = 0;
 static time_t period_started_at = 0;
+static int consecutive_failures = 0;
 
 static int worker_running = 0;
 static int worker_stop = 0;
@@ -206,14 +207,20 @@ void forgeops_performance_flush(const forgeops_configuration_t *config) {
   if (before_delivery_hook != NULL) before_delivery_hook();
 
   char *body = build_samples_json(config, snapshot, count, period_start, period_end);
-  int delivered = body != NULL && forgeops_client_deliver_performance_samples(config, body);
+  long status = body != NULL ? forgeops_client_deliver_performance_samples_status(config, body) : 0;
   free(body);
-  if (!delivered) {
-    free_snapshot(snapshot, count);
-    return;
-  }
 
   pthread_mutex_lock(&lock);
+  if (forgeops_delivery_outcome_for_status(status) == FORGEOPS_DELIVERY_FAILED) {
+    consecutive_failures += 1;
+    if (consecutive_failures < FORGEOPS_PERFORMANCE_MAX_CONSECUTIVE_FAILURES) {
+      pthread_mutex_unlock(&lock);
+      free_snapshot(snapshot, count);
+      return;
+    }
+    /* Failed too many times in a row: let this batch go, the same way a rejected one is. */
+  }
+  consecutive_failures = 0;
   for (size_t i = 0; i < count; i++) {
     bucket_t *current = find_bucket(snapshot[i].name);
     if (current == NULL) continue;
@@ -269,6 +276,7 @@ void forgeops_performance_reset_for_testing(void) {
   buckets = NULL;
   bucket_count = 0;
   bucket_capacity = 0;
+  consecutive_failures = 0;
   before_delivery_hook = NULL;
   pthread_mutex_unlock(&lock);
 }

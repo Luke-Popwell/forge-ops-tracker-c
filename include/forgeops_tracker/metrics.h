@@ -15,16 +15,19 @@
  * infrastructure_metric_buffer.rb, which are the same class twice; here it is one module with two
  * independent buffers, selected by a forgeops_metric_kind_t.
  *
- * Three deliberate differences from the Ruby buffers:
+ * Four deliberate differences from the Ruby buffers:
  *
  *  - A flush snapshots the first N entries and, on success, removes exactly those N, instead of
  *    resetting the whole list, so an entry recorded while the request is in flight (the lock is
  *    released around the network call) is kept for the next flush rather than lost.
  *  - A buffer is capped at FORGEOPS_METRICS_MAX_ENTRIES, and once full further entries are dropped
- *    until a flush succeeds: a plan without the feature answers 403 on every flush, and an uncapped
- *    buffer would then grow for as long as the process lives. Dropping the newest rather than the
- *    oldest keeps the entries a flush is delivering at the front of the array, which is what makes
- *    removing exactly them afterward exact.
+ *    until a flush succeeds or lets its batch go: an unreachable server fails every flush, and an
+ *    uncapped buffer would then grow for as long as the process lives. Dropping the newest rather
+ *    than the oldest keeps the entries a flush is delivering at the front of the array, which is
+ *    what makes removing exactly them afterward exact.
+ *  - A batch is not retried without end. One the server rejects (a 4xx other than 408 and 429, such
+ *    as the 403 a plan without the feature answers) is dropped at once, and one that has failed
+ *    FORGEOPS_METRICS_MAX_CONSECUTIVE_FAILURES flushes in a row is dropped too.
  *  - A NaN or infinite value is dropped at record time: printf would write "nan"/"inf", which is not
  *    valid JSON, and one bad entry would make the server reject the whole batch behind it.
  *
@@ -35,6 +38,9 @@
  */
 #define FORGEOPS_METRICS_MAX_ENTRIES 1000
 
+/* A batch that has failed this many flushes in a row is dropped rather than carried further. */
+#define FORGEOPS_METRICS_MAX_CONSECUTIVE_FAILURES 5
+
 typedef enum { FORGEOPS_METRIC_CUSTOM = 0, FORGEOPS_METRIC_INFRASTRUCTURE = 1 } forgeops_metric_kind_t;
 
 /*
@@ -44,7 +50,9 @@ typedef enum { FORGEOPS_METRIC_CUSTOM = 0, FORGEOPS_METRIC_INFRASTRUCTURE = 1 } 
  */
 int forgeops_metrics_record(const forgeops_configuration_t *config, forgeops_metric_kind_t kind, double value, const char *fields_json);
 
-/* Delivers everything buffered for `kind` as one batch. A failed delivery keeps every entry. */
+/* Delivers everything buffered for `kind` as one batch. A delivery that failed for now keeps every
+ * entry; a rejected batch, or one that has failed FORGEOPS_METRICS_MAX_CONSECUTIVE_FAILURES flushes
+ * in a row, is dropped. */
 void forgeops_metrics_flush(const forgeops_configuration_t *config, forgeops_metric_kind_t kind);
 
 /*

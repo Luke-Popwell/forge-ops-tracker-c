@@ -51,8 +51,18 @@ static int has_suffix(const char *s, const char *suffix) {
   return strcmp(s + (s_len - suffix_len), suffix) == 0;
 }
 
-static int compare_strings(const void *a, const void *b) {
-  return strcmp(*(const char **)a, *(const char **)b);
+typedef struct {
+  char *path;
+  time_t modified_at; /* 0 when stat() failed: never counted as too old, only toward the cap */
+} pending_t;
+
+/* Oldest first. Within one second the file name decides, which for the reports written by
+ * forgeops_crash_store_write (named by time(NULL), then a counter) is the order they were written. */
+static int compare_pending(const void *a, const void *b) {
+  const pending_t *left = a;
+  const pending_t *right = b;
+  if (left->modified_at != right->modified_at) return left->modified_at < right->modified_at ? -1 : 1;
+  return strcmp(left->path, right->path);
 }
 
 char **forgeops_crash_store_pending_paths(const forgeops_configuration_t *config) {
@@ -92,26 +102,62 @@ char **forgeops_crash_store_pending_paths(const forgeops_configuration_t *config
     return NULL;
   }
 
-  /* File names embed time(NULL) first, so a plain string sort is already a chronological sort:
-   * no need to stat() each file individually. */
-  qsort(names, count, sizeof(char *), compare_strings);
-
+  pending_t *pending = malloc(count * sizeof(pending_t));
   char **paths = malloc((count + 1) * sizeof(char *));
-  if (paths == NULL) {
+  if (pending == NULL || paths == NULL) {
     for (size_t i = 0; i < count; i++) free(names[i]);
     free(names);
+    free(pending);
+    free(paths);
     return NULL;
   }
+
+  /* Each file is stat()ed for its age anyway, so the same timestamp orders them: a raw signal
+   * report and an event payload are named differently, and only this puts the two in one
+   * chronological order. Anything too old is deleted here rather than listed. */
+  time_t cutoff = time(NULL) - FORGEOPS_CRASH_STORE_MAX_AGE_SECONDS;
+  size_t kept = 0;
   for (size_t i = 0; i < count; i++) {
     size_t path_len = strlen(config->crash_reports_directory) + 1 + strlen(names[i]) + 1;
-    paths[i] = malloc(path_len);
-    if (paths[i] != NULL) {
-      snprintf(paths[i], path_len, "%s/%s", config->crash_reports_directory, names[i]);
+    char *path = malloc(path_len);
+    if (path == NULL) {
+      free(names[i]);
+      continue;
     }
+    snprintf(path, path_len, "%s/%s", config->crash_reports_directory, names[i]);
     free(names[i]);
+
+    struct stat info;
+    time_t modified_at = stat(path, &info) == 0 ? info.st_mtime : 0;
+    if (modified_at != 0 && modified_at < cutoff) {
+      remove(path);
+      free(path);
+      continue;
+    }
+    pending[kept].path = path;
+    pending[kept].modified_at = modified_at;
+    kept++;
   }
-  paths[count] = NULL;
   free(names);
+
+  qsort(pending, kept, sizeof(pending_t), compare_pending);
+
+  /* More waiting than the cap allows: the oldest go. */
+  size_t excess = kept > FORGEOPS_CRASH_STORE_MAX_PENDING ? kept - FORGEOPS_CRASH_STORE_MAX_PENDING : 0;
+  for (size_t i = 0; i < excess; i++) {
+    remove(pending[i].path);
+    free(pending[i].path);
+  }
+
+  size_t listed = kept - excess;
+  for (size_t i = 0; i < listed; i++) paths[i] = pending[excess + i].path;
+  paths[listed] = NULL;
+  free(pending);
+
+  if (listed == 0) {
+    free(paths);
+    return NULL;
+  }
   return paths;
 }
 

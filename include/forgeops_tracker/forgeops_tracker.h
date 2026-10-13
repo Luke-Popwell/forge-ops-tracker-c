@@ -323,7 +323,7 @@ void forgeops_tracker_record_change_with_options(const char *kind, const char *t
  * performance buckets and both metric buffers. Call it after a capture you want delivered now,
  * such as a test error from a setup check, or before an exit an atexit hook won't see (_exit, a
  * signal). Without it, a normal exit uploads captured errors from an atexit hook anyway, stopping
- * at the first failed delivery so an offline exit waits for one timeout at most.
+ * at the first delivery that failed for now so an offline exit waits for one timeout at most.
  */
 void forgeops_tracker_flush(void);
 

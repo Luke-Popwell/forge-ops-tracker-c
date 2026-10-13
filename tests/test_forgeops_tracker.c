@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -2821,6 +2822,387 @@ TEST(tracker_a_program_that_captures_an_error_and_returns_from_main_delivers_it_
   remove_directory_recursive(warning_test_dir);
 }
 
+/* ---- A failed delivery: rejected for good, or failed for now ------------------------------------ */
+
+TEST(delivery_a_4xx_is_rejected_except_408_and_429_which_like_a_5xx_fail_for_now) {
+  const long rejected[] = {400, 401, 403, 404, 413, 422};
+  const long failed[] = {0, 408, 429, 500, 502, 503, 301};
+  const long delivered[] = {200, 201, 202, 204};
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    ASSERT_TRUE(forgeops_delivery_outcome_for_status(rejected[i]) == FORGEOPS_DELIVERY_REJECTED);
+  }
+  for (size_t i = 0; i < sizeof(failed) / sizeof(failed[0]); i++) {
+    ASSERT_TRUE(forgeops_delivery_outcome_for_status(failed[i]) == FORGEOPS_DELIVERY_FAILED);
+  }
+  for (size_t i = 0; i < sizeof(delivered) / sizeof(delivered[0]); i++) {
+    ASSERT_TRUE(forgeops_delivery_outcome_for_status(delivered[i]) == FORGEOPS_DELIVERY_DELIVERED);
+  }
+}
+
+TEST(delivery_client_status_is_the_http_status_and_zero_when_unreachable) {
+  pid_t child;
+  int port = start_test_server(422, &child);
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  char dsn[256];
+  snprintf(dsn, sizeof(dsn), "http://key@127.0.0.1:%d/api/v1/events", port);
+  forgeops_configuration_set_dsn(config, dsn);
+
+  ASSERT_TRUE(forgeops_client_deliver_status(config, "{}") == 422);
+  waitpid(child, NULL, 0);
+
+  forgeops_configuration_set_dsn(config, "http://key@127.0.0.1:1/events");
+  config->timeout_seconds = 1;
+  ASSERT_TRUE(forgeops_client_deliver_status(config, "{}") == 0);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(delivery_a_rejected_performance_batch_is_dropped_and_never_sent_again) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-rejected-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {401, 202};
+  int port = start_capturing_test_server(statuses, 2, body_path, &child);
+  performance_test_setup(port);
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+  forgeops_tracker_flush_performance(); /* 401: the server will never take this batch */
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max));
+  forgeops_tracker_flush_performance(); /* nothing left: no request */
+
+  forgeops_tracker_record_performance("GET /y", 20.0);
+  forgeops_tracker_flush_performance();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "GET /y") != NULL && strstr(body, "GET /x") == NULL);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(delivery_an_unreachable_server_keeps_every_performance_bucket) {
+  performance_test_setup(0); /* nothing is listening */
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+  forgeops_tracker_flush_performance();
+
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max) && count == 1);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(delivery_the_fifth_failed_flush_in_a_row_drops_a_performance_batch) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-fifth-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {503, 503, 503, 429, 500};
+  int port = start_capturing_test_server(statuses, 5, body_path, &child);
+  performance_test_setup(port);
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+  for (int i = 0; i < 4; i++) forgeops_tracker_flush_performance();
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max) && count == 1);
+
+  forgeops_tracker_flush_performance();
+  waitpid(child, NULL, 0);
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max));
+
+  /* The count starts again with the next batch: one more failure keeps it. */
+  forgeops_tracker_record_performance("GET /y", 10.0);
+  forgeops_tracker_flush_performance(); /* the server is gone: failed for now */
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /y", &count, &sum, &max) && count == 1);
+
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(delivery_a_successful_flush_starts_the_performance_failure_count_again) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-recount-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {503, 503, 503, 503, 202, 503, 503, 503, 503};
+  int port = start_capturing_test_server(statuses, 9, body_path, &child);
+  performance_test_setup(port);
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /x", 10.0);
+  for (int i = 0; i < 5; i++) forgeops_tracker_flush_performance();
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /x", &count, &sum, &max));
+
+  forgeops_tracker_record_performance("GET /y", 10.0);
+  for (int i = 0; i < 4; i++) forgeops_tracker_flush_performance();
+  waitpid(child, NULL, 0);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /y", &count, &sum, &max) && count == 1);
+
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(delivery_a_rejected_metric_batch_is_dropped_and_never_sent_again) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-metrics-rejected-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {403, 202};
+  int port = start_capturing_test_server(statuses, 2, body_path, &child);
+  metrics_test_setup(port);
+
+  forgeops_tracker_capture_metric("a", 1.0);
+  forgeops_tracker_flush_metrics(); /* 403: the server will never take this batch */
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 0);
+  forgeops_tracker_flush_metrics(); /* nothing left: no request */
+
+  forgeops_tracker_capture_metric("b", 2.0);
+  forgeops_tracker_flush_metrics();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"metric_name\":\"b\"") != NULL && strstr(body, "\"metric_name\":\"a\"") == NULL);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 0);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(delivery_an_entry_captured_while_a_rejected_delivery_is_in_flight_outlives_the_dropped_batch) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-metrics-rejected-inflight-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {422};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  metrics_test_setup(port);
+
+  forgeops_tracker_capture_metric("first", 1.0);
+  forgeops_metrics_set_before_delivery_hook_for_testing(capture_during_delivery);
+  forgeops_tracker_flush_metrics();
+  waitpid(child, NULL, 0);
+
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 1);
+
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(delivery_an_unreachable_server_keeps_every_metric) {
+  metrics_test_setup(0); /* nothing is listening */
+
+  forgeops_tracker_capture_metric("a", 1.0);
+  forgeops_tracker_flush_metrics();
+
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 1);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(delivery_the_fifth_failed_flush_in_a_row_drops_a_metric_batch) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-metrics-fifth-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {503, 503, 503, 429, 500};
+  int port = start_capturing_test_server(statuses, 5, body_path, &child);
+  metrics_test_setup(port);
+
+  forgeops_tracker_capture_metric("a", 1.0);
+  for (int i = 0; i < 4; i++) forgeops_tracker_flush_metrics();
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 1);
+
+  forgeops_tracker_flush_metrics();
+  waitpid(child, NULL, 0);
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 0);
+
+  /* The count starts again with the next batch: one more failure keeps it. */
+  forgeops_tracker_capture_metric("b", 2.0);
+  forgeops_tracker_flush_metrics(); /* the server is gone: failed for now */
+  ASSERT_TRUE(forgeops_metrics_count_for_testing(FORGEOPS_METRIC_CUSTOM) == 1);
+
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+static size_t count_pending_reports(const forgeops_configuration_t *config) {
+  char **paths = forgeops_crash_store_pending_paths(config);
+  size_t count = 0;
+  if (paths == NULL) return 0;
+  while (paths[count] != NULL) count++;
+  forgeops_crash_store_free_paths(paths);
+  return count;
+}
+
+static forgeops_configuration_t *reporter_test_setup(int port) {
+  forgeops_configuration_t *config = new_config_with_temp_crash_dir();
+  char dsn[256];
+  snprintf(dsn, sizeof(dsn), "http://key@127.0.0.1:%d/events", port);
+  forgeops_configuration_set_dsn(config, dsn);
+  free(config->environment);
+  config->environment = strdup("production");
+  config->timeout_seconds = 2;
+  return config;
+}
+
+TEST(delivery_a_rejected_report_is_deleted_and_never_sent_again) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-report-rejected-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {422, 400};
+  int port = start_capturing_test_server(statuses, 2, body_path, &child);
+  forgeops_configuration_t *config = reporter_test_setup(port);
+
+  forgeops_report_error(config, "First", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
+  forgeops_report_error(config, "Second", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
+  forgeops_upload_pending_reports(config);
+  waitpid(child, NULL, 0); /* both went up: the rejected first one did not hold the second back */
+
+  ASSERT_TRUE(count_pending_reports(config) == 0);
+
+  remove(body_path);
+  remove_directory_recursive(config->crash_reports_directory);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(delivery_a_report_is_kept_on_a_429_and_when_the_server_is_unreachable) {
+  pid_t child;
+  int port = start_test_server(429, &child);
+  forgeops_configuration_t *config = reporter_test_setup(port);
+
+  forgeops_report_error(config, "Boom", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
+  forgeops_upload_pending_reports(config);
+  waitpid(child, NULL, 0);
+  ASSERT_TRUE(count_pending_reports(config) == 1);
+
+  forgeops_upload_pending_reports(config); /* the server is gone now */
+  ASSERT_TRUE(count_pending_reports(config) == 1);
+
+  remove_directory_recursive(config->crash_reports_directory);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(delivery_the_exit_pass_deletes_a_rejected_report_and_goes_on_but_stops_at_one_that_failed_for_now) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-report-exit-%d.json", getpid());
+  pid_t child;
+  /* The third status is never served: the pass must stop at the 503. Were the third report sent
+   * anyway, it would be accepted and deleted, and only one would be left. */
+  const int statuses[] = {422, 503, 202};
+  int port = start_capturing_test_server(statuses, 3, body_path, &child);
+  forgeops_configuration_t *config = reporter_test_setup(port);
+
+  forgeops_report_error(config, "First", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
+  forgeops_report_error(config, "Second", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
+  forgeops_report_error(config, "Third", "bad", NULL, NULL, 0, NULL, NULL, 0, NULL, 0);
+  forgeops_upload_pending_reports_until_failure(config, 1);
+
+  ASSERT_TRUE(count_pending_reports(config) == 2);
+
+  kill(child, SIGKILL);
+  waitpid(child, NULL, 0);
+  remove(body_path);
+  remove_directory_recursive(config->crash_reports_directory);
+  forgeops_configuration_destroy(config);
+}
+
+/* Sets the modification time of every report in the directory from the number in its own body
+ * ({"n":3}), so a test decides how old each one is: age_seconds(n) seconds ago. */
+static void backdate_reports(const forgeops_configuration_t *config, long (*age_seconds)(int n)) {
+  DIR *dir = opendir(config->crash_reports_directory);
+  if (dir == NULL) return;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strstr(entry->d_name, ".json") == NULL) continue;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", config->crash_reports_directory, entry->d_name);
+    char *contents = forgeops_crash_store_read(path);
+    int n = 0;
+    if (contents != NULL && sscanf(contents, "{\"n\":%d}", &n) == 1) {
+      time_t when = time(NULL) - age_seconds(n);
+      struct timeval times[2] = {{when, 0}, {when, 0}};
+      utimes(path, times);
+    }
+    free(contents);
+  }
+  closedir(dir);
+}
+
+static int report_number(const char *path) {
+  char *contents = forgeops_crash_store_read(path);
+  int n = -1;
+  if (contents != NULL) sscanf(contents, "{\"n\":%d}", &n);
+  free(contents);
+  return n;
+}
+
+#define CAP_TEST_REPORTS (FORGEOPS_CRASH_STORE_MAX_PENDING + 3)
+
+static long an_hour_apart_oldest_first(int n) {
+  return (long)(CAP_TEST_REPORTS - n) * 3600;
+}
+
+TEST(crash_store_keeps_only_the_newest_twenty_and_deletes_the_rest) {
+  forgeops_configuration_t *config = new_config_with_temp_crash_dir();
+  for (int i = 0; i < CAP_TEST_REPORTS; i++) {
+    char payload[32];
+    snprintf(payload, sizeof(payload), "{\"n\":%d}", i);
+    ASSERT_TRUE(forgeops_crash_store_write(config, payload) == 0);
+  }
+  backdate_reports(config, an_hour_apart_oldest_first);
+
+  char **paths = forgeops_crash_store_pending_paths(config);
+  ASSERT_NOT_NULL(paths);
+  size_t count = 0;
+  while (paths[count] != NULL) count++;
+  ASSERT_TRUE(count == FORGEOPS_CRASH_STORE_MAX_PENDING);
+  ASSERT_TRUE(report_number(paths[0]) == 3); /* 0, 1 and 2 were the oldest */
+  ASSERT_TRUE(report_number(paths[count - 1]) == CAP_TEST_REPORTS - 1);
+  forgeops_crash_store_free_paths(paths);
+
+  /* Deleted from disk, not only left out of the list. */
+  size_t on_disk = 0;
+  DIR *dir = opendir(config->crash_reports_directory);
+  ASSERT_NOT_NULL(dir);
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strstr(entry->d_name, ".json") != NULL) on_disk++;
+  }
+  closedir(dir);
+  ASSERT_TRUE(on_disk == FORGEOPS_CRASH_STORE_MAX_PENDING);
+
+  remove_directory_recursive(config->crash_reports_directory);
+  forgeops_configuration_destroy(config);
+}
+
+/* 0 is an hour past the limit, 1 an hour short of it, 2 is new. */
+static long around_the_age_limit(int n) {
+  if (n == 0) return FORGEOPS_CRASH_STORE_MAX_AGE_SECONDS + 3600;
+  if (n == 1) return FORGEOPS_CRASH_STORE_MAX_AGE_SECONDS - 3600;
+  return 0;
+}
+
+TEST(crash_store_deletes_anything_older_than_seven_days) {
+  forgeops_configuration_t *config = new_config_with_temp_crash_dir();
+  ASSERT_TRUE(forgeops_crash_store_write(config, "{\"n\":0}") == 0);
+  ASSERT_TRUE(forgeops_crash_store_write(config, "{\"n\":1}") == 0);
+  ASSERT_TRUE(forgeops_crash_store_write(config, "{\"n\":2}") == 0);
+  backdate_reports(config, around_the_age_limit);
+
+  char **paths = forgeops_crash_store_pending_paths(config);
+  ASSERT_NOT_NULL(paths);
+  ASSERT_TRUE(report_number(paths[0]) == 1);
+  ASSERT_TRUE(report_number(paths[1]) == 2);
+  ASSERT_NULL(paths[2]);
+  forgeops_crash_store_free_paths(paths);
+  ASSERT_TRUE(count_pending_reports(config) == 2);
+
+  remove_directory_recursive(config->crash_reports_directory);
+  forgeops_configuration_destroy(config);
+}
+
 int main(void) {
   RUN(sql_mask_replaces_strings_and_numbers_but_not_identifiers_or_placeholders);
   RUN(sql_mask_handles_an_escaped_quote_a_cut_off_string_and_a_dollar_quoted_body);
@@ -2962,6 +3344,22 @@ int main(void) {
   RUN(tracker_never_warns_without_a_dsn_or_in_an_environment_that_sends);
   RUN(tracker_flush_uploads_an_explicit_capture_straight_away);
   RUN(tracker_a_program_that_captures_an_error_and_returns_from_main_delivers_it_on_its_first_run);
+
+  RUN(delivery_a_4xx_is_rejected_except_408_and_429_which_like_a_5xx_fail_for_now);
+  RUN(delivery_client_status_is_the_http_status_and_zero_when_unreachable);
+  RUN(delivery_a_rejected_performance_batch_is_dropped_and_never_sent_again);
+  RUN(delivery_an_unreachable_server_keeps_every_performance_bucket);
+  RUN(delivery_the_fifth_failed_flush_in_a_row_drops_a_performance_batch);
+  RUN(delivery_a_successful_flush_starts_the_performance_failure_count_again);
+  RUN(delivery_a_rejected_metric_batch_is_dropped_and_never_sent_again);
+  RUN(delivery_an_entry_captured_while_a_rejected_delivery_is_in_flight_outlives_the_dropped_batch);
+  RUN(delivery_an_unreachable_server_keeps_every_metric);
+  RUN(delivery_the_fifth_failed_flush_in_a_row_drops_a_metric_batch);
+  RUN(delivery_a_rejected_report_is_deleted_and_never_sent_again);
+  RUN(delivery_a_report_is_kept_on_a_429_and_when_the_server_is_unreachable);
+  RUN(delivery_the_exit_pass_deletes_a_rejected_report_and_goes_on_but_stops_at_one_that_failed_for_now);
+  RUN(crash_store_keeps_only_the_newest_twenty_and_deletes_the_rest);
+  RUN(crash_store_deletes_anything_older_than_seven_days);
 
   printf("\n%d run, %d failed\n", g_tests_run, g_tests_failed);
   return g_tests_failed == 0 ? 0 : 1;

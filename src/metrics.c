@@ -13,6 +13,7 @@
 typedef struct {
   char *entries[FORGEOPS_METRICS_MAX_ENTRIES];
   size_t count;
+  int consecutive_failures;
   int worker_running;
   pthread_t worker;
 } buffer_t;
@@ -152,12 +153,20 @@ void forgeops_metrics_flush(const forgeops_configuration_t *config, forgeops_met
 
   if (before_delivery_hook != NULL) before_delivery_hook();
 
-  int delivered = kind == FORGEOPS_METRIC_CUSTOM ? forgeops_client_deliver_metrics(config, body.data) : forgeops_client_deliver_infrastructure_metrics(config, body.data);
+  long status = kind == FORGEOPS_METRIC_CUSTOM ? forgeops_client_deliver_metrics_status(config, body.data) : forgeops_client_deliver_infrastructure_metrics_status(config, body.data);
   free(body.data);
-  if (!delivered) return;
 
   pthread_mutex_lock(&lock);
-  /* Exactly the entries just delivered: anything recorded while the request was in flight sits after
+  if (forgeops_delivery_outcome_for_status(status) == FORGEOPS_DELIVERY_FAILED) {
+    buffer->consecutive_failures += 1;
+    if (buffer->consecutive_failures < FORGEOPS_METRICS_MAX_CONSECUTIVE_FAILURES) {
+      pthread_mutex_unlock(&lock);
+      return;
+    }
+    /* Failed too many times in a row: let this batch go, the same way a rejected one is. */
+  }
+  buffer->consecutive_failures = 0;
+  /* Exactly the entries just delivered or dropped: anything recorded while the request was in flight sits after
    * them and stays for the next flush. */
   for (size_t i = 0; i < count; i++) free(buffer->entries[i]);
   memmove(buffer->entries, buffer->entries + count, (buffer->count - count) * sizeof(char *));
@@ -193,6 +202,7 @@ void forgeops_metrics_reset_for_testing(void) {
     buffers[k].worker_running = 0;
     for (size_t i = 0; i < buffers[k].count; i++) free(buffers[k].entries[i]);
     buffers[k].count = 0;
+    buffers[k].consecutive_failures = 0;
   }
   before_delivery_hook = NULL;
   pthread_mutex_unlock(&lock);

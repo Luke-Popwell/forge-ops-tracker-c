@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.0 (2026-10-13)
+
+- A delivery the server will never accept is no longer sent again and again. A response of 4xx (other than 408 and 429) now means the payload is let go: a crash or error report file is deleted, and a batch of performance samples, metrics or infrastructure readings is dropped. A network error, a timeout, a 5xx, 408 or 429 still keeps the payload for a later try, but not for good: a batch is dropped after five failed flushes in a row, at most 20 reports wait on disk (the oldest beyond that are deleted), and a report last written more than 7 days ago is deleted. Before, any failure kept the payload, so a rejected report was uploaded at every launch and a rejected batch at every flush.
+- The `atexit` upload no longer gets stuck behind one bad report. It used to stop at the first failed delivery of any kind, oldest first, so a report the server rejected blocked every report behind it at every exit. A rejected report is now deleted and the pass goes on; only a failure that may pass (network down, a 5xx, 408, 429) stops it, as before.
+- Pending reports are now uploaded oldest first by the time they were written, which also puts a crash report and an explicit error report in one order; before, they were ordered by file name.
+- New `forgeops_client_deliver_status` (and the same for performance samples, metrics and infrastructure metrics) return the HTTP status, 0 for no response, and `forgeops_delivery_outcome_for_status` sorts one into delivered, rejected or failed. Every existing function is unchanged: `forgeops_client_deliver` and the rest still return 1 only for a 2xx.
+
 ## 0.8.1 (2026-10-07)
 
 - The library now ships its MIT licence (`LICENSE.txt`). Earlier versions were published without one. No code changes.

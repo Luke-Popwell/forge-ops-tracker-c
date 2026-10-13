@@ -13,7 +13,14 @@ static size_t discard_response(char *ptr, size_t size, size_t nmemb, void *userd
   return size * nmemb;
 }
 
-static int post_json(const forgeops_configuration_t *config, char *url, const char *json_payload) {
+forgeops_delivery_outcome_t forgeops_delivery_outcome_for_status(long status) {
+  if (status >= 200 && status < 300) return FORGEOPS_DELIVERY_DELIVERED;
+  if (status >= 400 && status < 500 && status != 408 && status != 429) return FORGEOPS_DELIVERY_REJECTED;
+  return FORGEOPS_DELIVERY_FAILED;
+}
+
+/* The HTTP status of the response, or 0 when there was none (no DSN, a network error, a timeout). */
+static long post_json(const forgeops_configuration_t *config, char *url, const char *json_payload) {
   char *api_key = forgeops_configuration_api_key(config);
   if (url == NULL || api_key == NULL) {
     free(url);
@@ -44,40 +51,58 @@ static int post_json(const forgeops_configuration_t *config, char *url, const ch
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); /* this client may run alongside its own signal handler installation: don't let libcurl install/rely on its own SIGALRM-based timeout */
 
   CURLcode result = curl_easy_perform(curl);
-  int success = 0;
+  long status = 0;
   if (result == CURLE_OK) {
-    long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    success = status >= 200 && status < 300;
   }
 
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   free(url);
   free(api_key);
-  return success;
+  return status;
 }
 
-int forgeops_client_deliver(const forgeops_configuration_t *config, const char *json_payload) {
+static int delivered(long status) {
+  return forgeops_delivery_outcome_for_status(status) == FORGEOPS_DELIVERY_DELIVERED;
+}
+
+long forgeops_client_deliver_status(const forgeops_configuration_t *config, const char *json_payload) {
   return post_json(config, forgeops_configuration_ingestion_url(config), json_payload);
 }
 
-int forgeops_client_deliver_performance_samples(const forgeops_configuration_t *config, const char *json_payload) {
+long forgeops_client_deliver_performance_samples_status(const forgeops_configuration_t *config, const char *json_payload) {
   return post_json(config, forgeops_configuration_performance_samples_url(config), json_payload);
 }
 
-int forgeops_client_deliver_spans(const forgeops_configuration_t *config, const char *json_payload) {
-  return post_json(config, forgeops_configuration_spans_url(config), json_payload);
-}
-
-int forgeops_client_deliver_metrics(const forgeops_configuration_t *config, const char *json_payload) {
+long forgeops_client_deliver_metrics_status(const forgeops_configuration_t *config, const char *json_payload) {
   return post_json(config, forgeops_configuration_custom_metrics_url(config), json_payload);
 }
 
+long forgeops_client_deliver_infrastructure_metrics_status(const forgeops_configuration_t *config, const char *json_payload) {
+  return post_json(config, forgeops_configuration_infrastructure_metrics_url(config), json_payload);
+}
+
+int forgeops_client_deliver(const forgeops_configuration_t *config, const char *json_payload) {
+  return delivered(forgeops_client_deliver_status(config, json_payload));
+}
+
+int forgeops_client_deliver_performance_samples(const forgeops_configuration_t *config, const char *json_payload) {
+  return delivered(forgeops_client_deliver_performance_samples_status(config, json_payload));
+}
+
+int forgeops_client_deliver_spans(const forgeops_configuration_t *config, const char *json_payload) {
+  return delivered(post_json(config, forgeops_configuration_spans_url(config), json_payload));
+}
+
+int forgeops_client_deliver_metrics(const forgeops_configuration_t *config, const char *json_payload) {
+  return delivered(forgeops_client_deliver_metrics_status(config, json_payload));
+}
+
 int forgeops_client_deliver_changes(const forgeops_configuration_t *config, const char *json_payload) {
-  return post_json(config, forgeops_configuration_changes_url(config), json_payload);
+  return delivered(post_json(config, forgeops_configuration_changes_url(config), json_payload));
 }
 
 int forgeops_client_deliver_infrastructure_metrics(const forgeops_configuration_t *config, const char *json_payload) {
-  return post_json(config, forgeops_configuration_infrastructure_metrics_url(config), json_payload);
+  return delivered(forgeops_client_deliver_infrastructure_metrics_status(config, json_payload));
 }

@@ -30,14 +30,18 @@ void forgeops_report_error_with_sql(const forgeops_configuration_t *config, cons
 
 /*
  * Uploads every pending report left over from a previous call (or previous process launch),
- * deleting each on success and leaving a failed one in place for the next attempt. Synchronous:
- * call this from your own background thread if you don't want it blocking the caller.
+ * deleting each on success, and each one the server rejects (a 4xx other than 408 and 429: sending
+ * it again could never work). One that failed for now (a network error, a timeout, a 5xx, 408 or
+ * 429) is left in place for the next attempt, within the count and age crash_store.h keeps.
+ * Synchronous: call this from your own background thread if you don't want it blocking the caller.
  */
 void forgeops_upload_pending_reports(const forgeops_configuration_t *config);
 
-/* The same, but with stop_at_first_failure set, the first failed delivery ends the pass (leaving
- * that report and every later one for the next attempt): what the atexit upload uses, so a process
- * exiting while the network is down waits for one timeout rather than one per pending report. */
+/* The same, but with stop_at_first_failure set, the first delivery that failed for now ends the
+ * pass (leaving that report and every later one for the next attempt): what the atexit upload uses,
+ * so a process exiting while the network is down waits for one timeout rather than one per pending
+ * report. A rejected report is not such a failure: it is deleted and the pass goes on, so one
+ * report the server will never take can't hold back every report behind it. */
 void forgeops_upload_pending_reports_until_failure(const forgeops_configuration_t *config, int stop_at_first_failure);
 
 #endif

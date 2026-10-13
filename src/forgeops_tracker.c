@@ -93,8 +93,9 @@ static forgeops_configuration_t *active_configuration(void) {
 /* An explicit capture is written to disk first (so a crash right after it still loses nothing),
  * then uploaded by the next forgeops_tracker_flush / forgeops_tracker_upload_pending_reports call or,
  * failing that, here at a normal exit, so a program that captures one error and returns from main
- * still delivers it on its first run. Stops at the first failed delivery: an exit with the network
- * down waits for one timeout, and whatever is left goes up on the next run. */
+ * still delivers it on its first run. Stops at the first delivery that failed for now: an exit with
+ * the network down waits for one timeout, and whatever is left goes up on the next run. A report
+ * the server rejects is deleted and does not stop it. */
 static void upload_at_exit(void) {
   if (shared_configuration == NULL) return;
   forgeops_upload_pending_reports_until_failure(shared_configuration, 1);

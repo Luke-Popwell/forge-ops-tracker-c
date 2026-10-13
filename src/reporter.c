@@ -56,13 +56,14 @@ void forgeops_upload_pending_reports_until_failure(const forgeops_configuration_
       continue;
     }
 
-    int delivered = forgeops_client_deliver(config, payload);
-    if (delivered) {
+    forgeops_delivery_outcome_t outcome = forgeops_delivery_outcome_for_status(forgeops_client_deliver_status(config, payload));
+    if (outcome != FORGEOPS_DELIVERY_FAILED) {
+      /* Delivered, or rejected: the server will never take it, so delete rather than retry forever. */
       forgeops_crash_store_delete(*p);
     }
-    /* On failure, leave it in place; the next call retries it. */
+    /* On a failure that may pass, leave it in place; the next call retries it. */
     free(payload);
-    if (!delivered && stop_at_first_failure) break;
+    if (outcome == FORGEOPS_DELIVERY_FAILED && stop_at_first_failure) break;
   }
 
   forgeops_crash_store_free_paths(paths);

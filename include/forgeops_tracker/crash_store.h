@@ -17,6 +17,11 @@
  * as anything other than the raw bytes to POST.
  */
 
+/* The most pending reports kept on disk, and the longest one is kept: a report that keeps failing to
+ * upload (see forgeops_upload_pending_reports) must not pile up or be retried for good. */
+#define FORGEOPS_CRASH_STORE_MAX_PENDING 20
+#define FORGEOPS_CRASH_STORE_MAX_AGE_SECONDS (7L * 24 * 60 * 60)
+
 /* Writes json_payload to a new file, named by a timestamp + a small counter so concurrent writes
  * (unlikely, but not impossible) never collide. Returns 0 on success, -1 on any failure: never
  * crashes the host app over a write failure. */
@@ -25,7 +30,9 @@ int forgeops_crash_store_write(const forgeops_configuration_t *config, const cha
 /*
  * Lists every pending payload's path, oldest first, as a NULL-terminated array of newly-allocated
  * strings the caller must free (each string, then the array itself via
- * forgeops_crash_store_free_paths): or NULL if the directory doesn't exist or is empty.
+ * forgeops_crash_store_free_paths): or NULL if the directory doesn't exist or is empty. Anything
+ * last written more than FORGEOPS_CRASH_STORE_MAX_AGE_SECONDS ago, and the oldest beyond
+ * FORGEOPS_CRASH_STORE_MAX_PENDING, is deleted here first.
  */
 char **forgeops_crash_store_pending_paths(const forgeops_configuration_t *config);
 

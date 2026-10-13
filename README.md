@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.8.1
+  GIT_TAG v0.9.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -226,7 +226,10 @@ window on a normal exit. Both block on libcurl for up to `config->timeout_second
 of `record`/`stop`. A process that exits some other way (a fatal signal, `_exit`) loses the last
 window, like anything queued in memory. `forgeops_tracker_flush_performance()` sends it right now.
 
-A failed delivery keeps every tally, so the next flush's window just grows. What a flush delivered
+A delivery that failed for now (a network error, a timeout, a 5xx, 408 or 429) keeps every tally, so
+the next flush's window just grows, for up to five flushes in a row; after the fifth the batch is
+dropped. A batch the server rejects (any other 4xx) is dropped at once, since sending it again could
+never work. What a flush delivered
 is *subtracted* from the tallies afterward, never the whole set cleared: a record that lands from
 another thread while the network call is in flight (the lock is deliberately released around it)
 would otherwise be silently discarded, a real bug `sdks/go` had and fixed and that
@@ -388,11 +391,13 @@ signal). Every entry is stored as it was captured (a signup is a row, not a runn
 or sum you compute later is exact. Both are a no-op when reporting isn't enabled for the environment,
 and names are copied.
 
-A failed delivery keeps every entry for the next flush, and an entry captured while a delivery is in
-flight is kept too (the Ruby gem's own buffer loses it; a test pins this with a hook that captures at
-exactly that moment). Each buffer holds at most 1000 entries and drops further ones until a flush
-succeeds, since a plan without the feature rejects every flush and would otherwise grow it for as long
-as the process lives. A NaN or infinite value is dropped at capture: `printf` would write `nan`/`inf`,
+A delivery that failed for now (a network error, a timeout, a 5xx, 408 or 429) keeps every entry for
+the next flush, and an entry captured while a delivery is in flight is kept too (the Ruby gem's own
+buffer loses it; a test pins this with a hook that captures at exactly that moment). A batch the
+server rejects (any other 4xx, such as the 403 of a plan without the feature) is dropped at once, and
+so is one that has failed five flushes in a row. Each buffer holds at most 1000 entries and drops
+further ones until a flush succeeds or lets its batch go, since an unreachable server would otherwise
+grow it for as long as the process lives. A NaN or infinite value is dropped at capture: `printf` would write `nan`/`inf`,
 which is not valid JSON and would make the server reject the whole batch behind it. Requires a
 ForgeOps plan that includes custom metrics / infrastructure monitoring.
 
@@ -451,11 +456,16 @@ rather than held live in memory) and only then sent over the network:
 - **An explicit `forgeops_tracker_capture_error`** goes up at the next `forgeops_tracker_flush()` or
   `forgeops_tracker_upload_pending_reports()` call, or at the latest from an `atexit` hook when the
   program exits normally (returning from `main` or calling `exit`). The hook stops at the first
-  failed delivery, so an exit with the network down waits for one timeout at most; the rest stays
-  on disk for the next run. Call `forgeops_tracker_flush()` yourself before `_exit` or anything else
+  delivery that failed for now, so an exit with the network down waits for one timeout at most; the
+  rest stays on disk for the next run. A report the server rejects does not stop it: that one is
+  deleted and the hook goes on to the next. Call `forgeops_tracker_flush()` yourself before `_exit` or anything else
   that skips `atexit` hooks.
 
-A failed upload leaves the file in place for the next call to retry. Uploads are synchronous: there
+An upload that failed for now (a network error, a timeout, a 5xx, 408 or 429) leaves the file in
+place for the next call to retry. A report the server rejects (any other 4xx) is deleted, since
+sending it again could never work. At most 20 reports wait on disk (the oldest beyond that are
+deleted) and one last written more than 7 days ago is deleted, so a report that can't be delivered is
+not retried for good. Uploads are synchronous: there
 is no background thread doing them, since plain C has no runtime event loop to hang one off of. If
 you want them off your main thread, spawn one yourself and call `forgeops_tracker_flush()` or
 `forgeops_tracker_upload_pending_reports()` from it.

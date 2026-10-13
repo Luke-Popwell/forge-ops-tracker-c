@@ -46,4 +46,30 @@ int forgeops_client_deliver_infrastructure_metrics(const forgeops_configuration_
  */
 int forgeops_client_deliver_changes(const forgeops_configuration_t *config, const char *json_payload);
 
+/*
+ * What became of one delivery attempt. Rejected is a 4xx other than 408 and 429: the server will
+ * never take this payload, so whoever holds it lets it go instead of sending it again. Failed is
+ * everything that may work later (no DSN, a network error, a timeout, a 5xx, 408, 429), so the
+ * payload is kept and retried, within the bounds each caller sets.
+ */
+typedef enum {
+  FORGEOPS_DELIVERY_DELIVERED = 0,
+  FORGEOPS_DELIVERY_REJECTED = 1,
+  FORGEOPS_DELIVERY_FAILED = 2
+} forgeops_delivery_outcome_t;
+
+/* The outcome an HTTP status stands for; 0 is no response at all. */
+forgeops_delivery_outcome_t forgeops_delivery_outcome_for_status(long status);
+
+/*
+ * The same requests as forgeops_client_deliver, forgeops_client_deliver_performance_samples,
+ * forgeops_client_deliver_metrics and forgeops_client_deliver_infrastructure_metrics, returning the
+ * HTTP status instead (0 when there was no response), for the callers inside this client that hold
+ * on to a payload and so need to know whether a failure is final, not only that it happened.
+ */
+long forgeops_client_deliver_status(const forgeops_configuration_t *config, const char *json_payload);
+long forgeops_client_deliver_performance_samples_status(const forgeops_configuration_t *config, const char *json_payload);
+long forgeops_client_deliver_metrics_status(const forgeops_configuration_t *config, const char *json_payload);
+long forgeops_client_deliver_infrastructure_metrics_status(const forgeops_configuration_t *config, const char *json_payload);
+
 #endif

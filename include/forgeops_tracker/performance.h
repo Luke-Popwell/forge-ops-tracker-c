@@ -25,15 +25,21 @@
  */
 #define FORGEOPS_PERFORMANCE_MAX_TRANSACTIONS 500
 
+/* A batch that has failed this many flushes in a row is dropped rather than carried further. */
+#define FORGEOPS_PERFORMANCE_MAX_CONSECUTIVE_FAILURES 5
+
 /* Does nothing when config->track_performance is 0 or reporting isn't enabled for this environment. */
 void forgeops_performance_record(const forgeops_configuration_t *config, const char *transaction_name, double duration_ms);
 
 /*
- * Snapshots the buffered buckets and delivers them as one batch. A failed delivery keeps every
- * bucket where it is, so the next flush's batch just grows instead of losing what was already
- * tallied: there's no other copy of this data anywhere.
+ * Snapshots the buffered buckets and delivers them as one batch. A delivery that failed for now (a
+ * network error, a timeout, a 5xx, 408 or 429) keeps every bucket where it is, so the next flush's
+ * batch just grows instead of losing what was already tallied: there's no other copy of this data
+ * anywhere. That is bounded: the batch is dropped when the server rejects it (any other 4xx, which
+ * no retry can fix) or once FORGEOPS_PERFORMANCE_MAX_CONSECUTIVE_FAILURES flushes in a row have
+ * failed.
  *
- * Only exactly what this snapshot delivered is removed afterward, subtracted from whatever is in
+ * Only exactly what this snapshot delivered (or dropped) is removed afterward, subtracted from whatever is in
  * each bucket by then, never the whole set cleared outright. forgeops_performance_record can run on
  * another thread while delivery is in flight (the lock is deliberately released around the network
  * call), so a record for a transaction already in the snapshot, or a brand-new one, can land in the
