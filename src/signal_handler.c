@@ -14,6 +14,7 @@
 #include "forgeops_tracker/breadcrumbs.h"
 #include "forgeops_tracker/forgeops_tracker.h"
 #include "forgeops_tracker/spans.h"
+#include "forgeops_tracker/strict_privacy.h"
 #include "strbuf.h"
 
 static const int FATAL_SIGNALS[] = {SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGTRAP};
@@ -141,10 +142,20 @@ char *forgeops_signal_handler_complete_json(const forgeops_configuration_t *conf
     if (*p == '"' || *p == '\\') forgeops_strbuf_append(&out, "\\", 1);
     forgeops_strbuf_append(&out, p, 1);
   }
-  forgeops_strbuf_append_str(&out, "\",\"message\":\"Uncaught fatal signal: ");
-  for (const char *p = signal_name; *p != '\0'; p++) {
-    if (*p == '"' || *p == '\\') forgeops_strbuf_append(&out, "\\", 1);
-    forgeops_strbuf_append(&out, p, 1);
+  if (config->strict_privacy) {
+    /* See strict_privacy.h: the fingerprint of the message this report would otherwise carry. */
+    char message[sizeof(signal_name) + 32];
+    snprintf(message, sizeof(message), "Uncaught fatal signal: %s", signal_name);
+    char fingerprint[FORGEOPS_MESSAGE_FINGERPRINT_SIZE];
+    forgeops_strict_privacy_message_fingerprint(message, fingerprint);
+    forgeops_strbuf_append_str(&out, "\",\"message\":\"\",\"message_fingerprint\":\"");
+    forgeops_strbuf_append_str(&out, fingerprint);
+  } else {
+    forgeops_strbuf_append_str(&out, "\",\"message\":\"Uncaught fatal signal: ");
+    for (const char *p = signal_name; *p != '\0'; p++) {
+      if (*p == '"' || *p == '\\') forgeops_strbuf_append(&out, "\\", 1);
+      forgeops_strbuf_append(&out, p, 1);
+    }
   }
   forgeops_strbuf_append_str(&out, "\",\"backtrace\":[");
 
@@ -207,7 +218,7 @@ char *forgeops_signal_handler_complete_json(const forgeops_configuration_t *conf
   json_append_string_or_null(&out, config->release);
   forgeops_strbuf_append_str(&out, ",\"server_name\":");
   json_append_string_or_null(&out, config->server_name);
-  forgeops_strbuf_append_str(&out, ",\"context\":{},\"tags\":{}");
+  if (!config->strict_privacy) forgeops_strbuf_append_str(&out, ",\"context\":{},\"tags\":{}");
 
   /* Filled in with whoever is "current" (on *this* thread) at upload time, not necessarily who
    * was signed in the moment the signal actually fired: the signal handler itself can never
@@ -218,7 +229,14 @@ char *forgeops_signal_handler_complete_json(const forgeops_configuration_t *conf
   const char **user_values = NULL;
   size_t user_count = 0;
   forgeops_tracker_current_user(&user_keys, &user_values, &user_count);
-  if (user_count > 0) {
+  const char *user_id = forgeops_strict_privacy_user_id(user_keys, user_values, user_count);
+  if (config->strict_privacy) {
+    if (user_id != NULL) {
+      forgeops_strbuf_append_str(&out, ",\"user\":{\"id\":");
+      json_append_escaped_string(&out, user_id);
+      forgeops_strbuf_append(&out, "}", 1);
+    }
+  } else if (user_count > 0) {
     forgeops_strbuf_append_str(&out, ",\"user\":{");
     for (size_t i = 0; i < user_count; i++) {
       if (i > 0) forgeops_strbuf_append(&out, ",", 1);
@@ -231,7 +249,7 @@ char *forgeops_signal_handler_complete_json(const forgeops_configuration_t *conf
 
   /* The crashing thread's trail, dumped by the handler itself: the one field here that is exact
    * rather than filled in at upload time. Already scrubbed when each entry was added. */
-  if (crumb_count > 0) {
+  if (crumb_count > 0 && !config->strict_privacy) {
     forgeops_strbuf_append_str(&out, ",\"breadcrumbs\":[");
     forgeops_strbuf_append_str(&out, crumbs.data);
     forgeops_strbuf_append(&out, "]", 1);

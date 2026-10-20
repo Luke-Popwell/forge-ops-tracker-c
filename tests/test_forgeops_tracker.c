@@ -35,6 +35,7 @@
 #include "forgeops_tracker/reporter.h"
 #include "forgeops_tracker/signal_handler.h"
 #include "forgeops_tracker/spans.h"
+#include "forgeops_tracker/strict_privacy.h"
 #include "forgeops_tracker/trace_parent.h"
 
 static int g_tests_run = 0;
@@ -3203,6 +3204,491 @@ TEST(crash_store_deletes_anything_older_than_seven_days) {
   forgeops_configuration_destroy(config);
 }
 
+/* Strict privacy */
+
+/*
+ * The vectors are read straight from tests/fixtures/strict_privacy_vectors.json (a byte-identical
+ * copy of sdks/strict_privacy_vectors.json, generated from the server's own implementation), so
+ * this suite can never drift from them. That file is a fixed shape: an object of three arrays of
+ * flat objects whose values are all strings, so a small reader for exactly that shape stands in
+ * for a JSON library this SDK doesn't otherwise need.
+ */
+#define MAX_VECTORS 64
+#define MAX_VECTOR_FIELDS 3
+
+typedef struct {
+  char *keys[MAX_VECTOR_FIELDS];
+  char *values[MAX_VECTOR_FIELDS];
+  int count;
+} vector_t;
+
+typedef struct {
+  char *text;
+  const char *at;
+} vector_reader_t;
+
+static void vector_skip_space(vector_reader_t *r) {
+  while (*r->at == ' ' || *r->at == '\n' || *r->at == '\r' || *r->at == '\t') r->at++;
+}
+
+/* Appends code point cp to out as UTF-8. */
+static size_t vector_put_utf8(char *out, unsigned long cp) {
+  if (cp < 0x80) { out[0] = (char)cp; return 1; }
+  if (cp < 0x800) { out[0] = (char)(0xC0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+  if (cp < 0x10000) { out[0] = (char)(0xE0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[2] = (char)(0x80 | (cp & 0x3F)); return 3; }
+  out[0] = (char)(0xF0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F));
+  return 4;
+}
+
+/* A JSON string literal at r->at, decoded (escapes included) into a new string; NULL if it isn't one. */
+static char *vector_read_string(vector_reader_t *r) {
+  vector_skip_space(r);
+  if (*r->at != '"') return NULL;
+  r->at++;
+  char *out = malloc(strlen(r->at) + 1);
+  size_t n = 0;
+  while (*r->at != '"' && *r->at != '\0') {
+    if (*r->at != '\\') { out[n++] = *r->at++; continue; }
+    r->at++;
+    char c = *r->at++;
+    switch (c) {
+      case 'n': out[n++] = '\n'; break;
+      case 't': out[n++] = '\t'; break;
+      case 'r': out[n++] = '\r'; break;
+      case 'b': out[n++] = '\b'; break;
+      case 'f': out[n++] = '\f'; break;
+      case 'u': {
+        unsigned long cp = strtoul((char[5]){r->at[0], r->at[1], r->at[2], r->at[3], '\0'}, NULL, 16);
+        r->at += 4;
+        if (cp >= 0xD800 && cp < 0xDC00 && r->at[0] == '\\' && r->at[1] == 'u') {
+          unsigned long low = strtoul((char[5]){r->at[2], r->at[3], r->at[4], r->at[5], '\0'}, NULL, 16);
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+          r->at += 6;
+        }
+        n += vector_put_utf8(out + n, cp);
+        break;
+      }
+      default: out[n++] = c; break; /* \" \\ \/ */
+    }
+  }
+  if (*r->at == '"') r->at++;
+  out[n] = '\0';
+  return out;
+}
+
+static char *read_vectors_file(void) {
+  return read_whole_file(FORGEOPS_TEST_FIXTURES_DIR "/strict_privacy_vectors.json");
+}
+
+/* Reads the array under "section" into vectors (each a flat object of strings); returns how many,
+ * or -1 if the file or section is missing or the file isn't the expected shape. */
+static int load_vectors(const char *section, vector_t *vectors) {
+  char *text = read_vectors_file();
+  if (text == NULL) return -1;
+  char needle[64];
+  snprintf(needle, sizeof(needle), "\"%s\":", section);
+  const char *start = strstr(text, needle);
+  if (start == NULL) { free(text); return -1; }
+
+  vector_reader_t r = {text, start + strlen(needle)};
+  vector_skip_space(&r);
+  if (*r.at++ != '[') { free(text); return -1; }
+  int count = 0;
+  for (;;) {
+    vector_skip_space(&r);
+    if (*r.at == ']') break;
+    if (*r.at == ',') { r.at++; continue; }
+    if (*r.at++ != '{' || count == MAX_VECTORS) { free(text); return -1; }
+    vector_t *v = &vectors[count++];
+    v->count = 0;
+    for (;;) {
+      vector_skip_space(&r);
+      if (*r.at == '}') { r.at++; break; }
+      if (*r.at == ',') { r.at++; continue; }
+      char *key = vector_read_string(&r);
+      vector_skip_space(&r);
+      if (key == NULL || *r.at++ != ':' || v->count == MAX_VECTOR_FIELDS) { free(key); free(text); return -1; }
+      char *value = vector_read_string(&r);
+      if (value == NULL) { free(key); free(text); return -1; }
+      v->keys[v->count] = key;
+      v->values[v->count++] = value;
+    }
+  }
+  free(text);
+  return count;
+}
+
+static const char *vector_field(const vector_t *v, const char *key) {
+  for (int i = 0; i < v->count; i++) {
+    if (strcmp(v->keys[i], key) == 0) return v->values[i];
+  }
+  return NULL;
+}
+
+static void free_vectors(vector_t *vectors, int count) {
+  for (int i = 0; i < count; i++) {
+    for (int f = 0; f < vectors[i].count; f++) {
+      free(vectors[i].keys[f]);
+      free(vectors[i].values[f]);
+    }
+  }
+}
+
+/* How many entries the section has in the file, counted independently of load_vectors (by the
+ * one key every entry of it carries), so a reader bug can't quietly skip an entry. */
+static int count_entries(const char *first_key) {
+  char *text = read_vectors_file();
+  if (text == NULL) return -1;
+  char needle[64];
+  snprintf(needle, sizeof(needle), "\"%s\":", first_key);
+  int count = 0;
+  for (const char *p = strstr(text, needle); p != NULL; p = strstr(p + 1, needle)) count++;
+  free(text);
+  return count;
+}
+
+TEST(strict_privacy_every_fingerprint_vector_normalizes_and_hashes_exactly) {
+  vector_t vectors[MAX_VECTORS];
+  int count = load_vectors("fingerprint", vectors);
+  ASSERT_TRUE(count > 0);
+  int expected = count_entries("normalized");
+  int failures = 0;
+  for (int i = 0; i < count; i++) {
+    const char *message = vector_field(&vectors[i], "message");
+    char *normalized = forgeops_strict_privacy_normalize_message(message);
+    char fingerprint[FORGEOPS_MESSAGE_FINGERPRINT_SIZE];
+    forgeops_strict_privacy_message_fingerprint(message, fingerprint);
+    if (normalized == NULL || strcmp(normalized, vector_field(&vectors[i], "normalized")) != 0 || strcmp(fingerprint, vector_field(&vectors[i], "fingerprint")) != 0) {
+      printf("  vector %d: \"%s\" normalized to \"%s\" (%s)\n", i, message, normalized != NULL ? normalized : "(null)", fingerprint);
+      failures++;
+    }
+    free(normalized);
+  }
+  free_vectors(vectors, count);
+  ASSERT_TRUE(count == expected);
+  ASSERT_TRUE(failures == 0);
+}
+
+TEST(strict_privacy_every_path_vector_has_its_ids_taken_out) {
+  vector_t vectors[MAX_VECTORS];
+  int count = load_vectors("path", vectors);
+  ASSERT_TRUE(count > 0);
+  int expected = count_entries("path") - 1; /* the section's own key matches too */
+  int failures = 0;
+  for (int i = 0; i < count; i++) {
+    char *path = forgeops_strict_privacy_path_without_ids(vector_field(&vectors[i], "path"));
+    if (path == NULL || strcmp(path, vector_field(&vectors[i], "strict")) != 0) {
+      printf("  path \"%s\" became \"%s\"\n", vector_field(&vectors[i], "path"), path != NULL ? path : "(null)");
+      failures++;
+    }
+    free(path);
+  }
+  free_vectors(vectors, count);
+  ASSERT_TRUE(count == expected);
+  ASSERT_TRUE(failures == 0);
+}
+
+TEST(strict_privacy_every_span_name_vector_keeps_only_the_method_and_host) {
+  vector_t vectors[MAX_VECTORS];
+  int count = load_vectors("span_name", vectors);
+  ASSERT_TRUE(count > 0);
+  int expected = count_entries("name");
+  int failures = 0;
+  for (int i = 0; i < count; i++) {
+    char *name = forgeops_strict_privacy_span_name(vector_field(&vectors[i], "name"));
+    if (name == NULL || strcmp(name, vector_field(&vectors[i], "strict")) != 0) {
+      printf("  span name \"%s\" became \"%s\"\n", vector_field(&vectors[i], "name"), name != NULL ? name : "(null)");
+      failures++;
+    }
+    free(name);
+  }
+  free_vectors(vectors, count);
+  ASSERT_TRUE(count == expected);
+  ASSERT_TRUE(failures == 0);
+}
+
+TEST(strict_privacy_is_off_by_default_and_read_from_the_environment_but_code_wins) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  ASSERT_TRUE(config->strict_privacy == 0);
+  ASSERT_TRUE(config->privacy_allowed_field_count == 0);
+  forgeops_configuration_destroy(config);
+
+  setenv("FORGE_OPS_STRICT_PRIVACY", "true", 1);
+  setenv("FORGE_OPS_PRIVACY_ALLOWED_FIELDS", "error_code, feature,,", 1);
+  config = forgeops_configuration_create();
+  unsetenv("FORGE_OPS_STRICT_PRIVACY");
+  unsetenv("FORGE_OPS_PRIVACY_ALLOWED_FIELDS");
+  ASSERT_TRUE(config->strict_privacy == 1);
+  ASSERT_TRUE(config->privacy_allowed_field_count == 2);
+  ASSERT_STREQ(config->privacy_allowed_fields[0], "error_code");
+  ASSERT_STREQ(config->privacy_allowed_fields[1], "feature");
+  ASSERT_TRUE(forgeops_strict_privacy_allows_field(config, "feature"));
+  ASSERT_TRUE(!forgeops_strict_privacy_allows_field(config, "Feature"));
+
+  /* Set in code after the environment seeded it: the code's value is the one that holds. */
+  config->strict_privacy = 0;
+  const char *fields[] = {"tenant"};
+  forgeops_configuration_set_privacy_allowed_fields(config, fields, 1);
+  ASSERT_TRUE(config->privacy_allowed_field_count == 1);
+  ASSERT_STREQ(config->privacy_allowed_fields[0], "tenant");
+  forgeops_configuration_destroy(config);
+
+  setenv("FORGE_OPS_STRICT_PRIVACY", "no", 1);
+  config = forgeops_configuration_create();
+  unsetenv("FORGE_OPS_STRICT_PRIVACY");
+  ASSERT_TRUE(config->strict_privacy == 0);
+  forgeops_configuration_destroy(config);
+}
+
+/* The one event both strict privacy tests build: free text in every field strict privacy drops. */
+static char *build_private_event(const forgeops_configuration_t *config) {
+  const char *context_keys[] = {"error_code", "patient_name", "count"};
+  const char *context_values[] = {"E42", "Jane Doe", "3"};
+  const char *user_keys[] = {"id", "email", "username"};
+  const char *user_values[] = {"42", "jane@example.com", "jdoe"};
+  const char *crumbs[] = {"{\"category\":\"a\",\"message\":\"opened chart for Jane\",\"level\":\"info\",\"timestamp\":\"t\",\"data\":{}}"};
+  return forgeops_build_event_json_with_sql(config, "RecordNotFound", "Couldn't find Invoice with id=8821", context_keys, context_values, 3, user_keys, user_values, 3, crumbs, 1, "SELECT * FROM patients WHERE name = 'Jane'");
+}
+
+/* The event with its occurred_at value blanked, the one field two builds a moment apart may differ in. */
+static void blank_occurred_at(char *json) {
+  char *at = strstr(json, "\"occurred_at\":\"");
+  if (at == NULL) return;
+  for (at += strlen("\"occurred_at\":\""); *at != '"' && *at != '\0'; at++) *at = '0';
+}
+
+TEST(strict_privacy_an_event_carries_only_structured_facts_and_a_message_fingerprint) {
+  forgeops_configuration_t *config = forgeops_configuration_create();
+  config->strict_privacy = 1;
+  config->capture_sql_statement = 1;
+  const char *fields[] = {"error_code", "count"};
+  forgeops_configuration_set_privacy_allowed_fields(config, fields, 2);
+
+  char *json = build_private_event(config);
+  ASSERT_NOT_NULL(json);
+  ASSERT_TRUE(strstr(json, "\"exception_class\":\"RecordNotFound\"") != NULL);
+  ASSERT_TRUE(strstr(json, "\"message\":\"\"") != NULL);
+  ASSERT_TRUE(strstr(json, "\"message_fingerprint\":\"b6959809369b97323c7852eaeb67d4ef\"") != NULL);
+  ASSERT_TRUE(strstr(json, "Invoice") == NULL);
+  ASSERT_TRUE(strstr(json, "\"context\":{\"error_code\":\"E42\",\"count\":\"3\"}") != NULL);
+  ASSERT_TRUE(strstr(json, "Jane") == NULL); /* not in context, breadcrumbs or the SQL statement */
+  ASSERT_TRUE(strstr(json, "\"tags\"") == NULL);
+  ASSERT_TRUE(strstr(json, "\"user\":{\"id\":\"42\"}") != NULL);
+  ASSERT_TRUE(strstr(json, "jane@example.com") == NULL);
+  ASSERT_TRUE(strstr(json, "jdoe") == NULL);
+  ASSERT_TRUE(strstr(json, "\"breadcrumbs\"") == NULL);
+  ASSERT_TRUE(strstr(json, "\"sql_statement\"") == NULL);
+  ASSERT_TRUE(strstr(json, "\"sql_objects\":") != NULL);
+  ASSERT_TRUE(strstr(json, "\"endpoint\"") == NULL);
+  ASSERT_TRUE(strstr(json, "context_line") == NULL);
+  ASSERT_TRUE(strstr(json, "\"backtrace\":[{") != NULL);
+  ASSERT_TRUE(strstr(json, "\"environment\":") != NULL);
+  ASSERT_TRUE(strstr(json, "\"sdk_name\":\"c\"") != NULL);
+  free(json);
+
+  /* With no allowed fields, context is left out entirely, and so is a user with no id. */
+  forgeops_configuration_set_privacy_allowed_fields(config, NULL, 0);
+  const char *context_keys[] = {"error_code"};
+  const char *context_values[] = {"E42"};
+  const char *user_keys[] = {"email"};
+  const char *user_values[] = {"jane@example.com"};
+  json = forgeops_build_event_json(config, "MyError", NULL, context_keys, context_values, 1, user_keys, user_values, 1, NULL, 0);
+  ASSERT_TRUE(strstr(json, "\"context\"") == NULL);
+  ASSERT_TRUE(strstr(json, "\"user\"") == NULL);
+  ASSERT_TRUE(strstr(json, "\"message_fingerprint\":\"e3b0c44298fc1c149afbf4c8996fb924\"") != NULL); /* an absent message is "" */
+  free(json);
+
+  /* Source context is off under strict privacy, even for a real in-app file and line. */
+  ASSERT_NULL(forgeops_source_context_json(config, 1, __FILE__, __LINE__));
+  config->strict_privacy = 0;
+  char *context = forgeops_source_context_json(config, 1, __FILE__, __LINE__);
+  ASSERT_NOT_NULL(context);
+  free(context);
+  forgeops_configuration_destroy(config);
+}
+
+TEST(strict_privacy_off_leaves_an_event_exactly_as_before) {
+  forgeops_configuration_t *plain = forgeops_configuration_create();
+  plain->capture_sql_statement = 1;
+  forgeops_configuration_t *off = forgeops_configuration_create();
+  off->capture_sql_statement = 1;
+  off->strict_privacy = 0;
+  const char *fields[] = {"error_code"};
+  forgeops_configuration_set_privacy_allowed_fields(off, fields, 1); /* ignored while it's off */
+
+  char *expected = build_private_event(plain);
+  char *actual = build_private_event(off);
+  ASSERT_NOT_NULL(expected);
+  ASSERT_NOT_NULL(actual);
+  blank_occurred_at(expected);
+  blank_occurred_at(actual);
+  ASSERT_STREQ(actual, expected);
+  ASSERT_TRUE(strstr(actual, "\"message\":\"Couldn't find Invoice with id=8821\"") != NULL);
+  ASSERT_TRUE(strstr(actual, "\"message_fingerprint\"") == NULL);
+  ASSERT_TRUE(strstr(actual, "\"patient_name\":\"Jane Doe\"") != NULL);
+  ASSERT_TRUE(strstr(actual, "\"tags\":{}") != NULL);
+  ASSERT_TRUE(strstr(actual, "\"email\":\"jane@example.com\"") != NULL);
+  ASSERT_TRUE(strstr(actual, "\"breadcrumbs\":[") != NULL);
+  ASSERT_TRUE(strstr(actual, "\"sql_statement\":") != NULL);
+
+  free(expected);
+  free(actual);
+  forgeops_configuration_destroy(plain);
+  forgeops_configuration_destroy(off);
+}
+
+TEST(strict_privacy_records_no_breadcrumbs_and_a_crash_report_carries_no_text) {
+  char dir[256];
+  forgeops_configuration_t *config = breadcrumb_test_setup("strict", dir, sizeof(dir));
+  config->strict_privacy = 1;
+  const char *user_keys[] = {"id", "email"};
+  const char *user_values[] = {"7", "jane@example.com"};
+  forgeops_tracker_set_user(user_keys, user_values, 2);
+
+  forgeops_tracker_add_breadcrumb("opened chart for Jane", NULL, NULL, NULL, NULL, 0);
+  size_t count = 0;
+  ASSERT_NULL(forgeops_breadcrumbs_snapshot(&count));
+
+  forgeops_signal_handler_install(dir);
+  forgeops_signal_handler_write_report(11);
+  DIR *directory = opendir(dir);
+  ASSERT_NOT_NULL(directory);
+  char raw_path[512] = {0};
+  struct dirent *entry;
+  while ((entry = readdir(directory)) != NULL) {
+    if (strncmp(entry->d_name, "signal-11-", 10) == 0) snprintf(raw_path, sizeof(raw_path), "%s/%s", dir, entry->d_name);
+  }
+  closedir(directory);
+  ASSERT_TRUE(raw_path[0] != '\0');
+
+  /* A trail left in the raw file (by a run before strict privacy was turned on) is not sent either. */
+  FILE *f = fopen(raw_path, "a");
+  ASSERT_NOT_NULL(f);
+  fputs("#breadcrumb {\"category\":\"custom\",\"message\":\"older\",\"level\":\"info\",\"timestamp\":\"t\",\"data\":{}}\n", f);
+  fclose(f);
+
+  char *json = forgeops_signal_handler_complete_json(config, raw_path);
+  ASSERT_NOT_NULL(json);
+  char signal_name[256] = {0};
+  f = fopen(raw_path, "r");
+  ASSERT_NOT_NULL(f);
+  ASSERT_NOT_NULL(fgets(signal_name, sizeof(signal_name), f));
+  fclose(f);
+  signal_name[strcspn(signal_name, "\n")] = '\0';
+  char message[300];
+  snprintf(message, sizeof(message), "Uncaught fatal signal: %s", signal_name);
+  char fingerprint[FORGEOPS_MESSAGE_FINGERPRINT_SIZE];
+  forgeops_strict_privacy_message_fingerprint(message, fingerprint);
+  char expected[96];
+  snprintf(expected, sizeof(expected), "\"message\":\"\",\"message_fingerprint\":\"%s\"", fingerprint);
+  ASSERT_TRUE(strstr(json, expected) != NULL);
+  ASSERT_TRUE(strstr(json, "Uncaught") == NULL);
+  ASSERT_TRUE(strstr(json, "\"breadcrumbs\"") == NULL);
+  ASSERT_TRUE(strstr(json, "\"context\"") == NULL);
+  ASSERT_TRUE(strstr(json, "\"user\":{\"id\":\"7\"}") != NULL);
+  ASSERT_TRUE(strstr(json, "jane@example.com") == NULL);
+
+  free(json);
+  remove_directory_recursive(dir);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(strict_privacy_spans_keep_the_method_and_host_and_only_database_data) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-spans-strict-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  forgeops_configuration_t *config = tracing_test_setup(port);
+  config->strict_privacy = 1;
+
+  forgeops_trace_t trace = forgeops_tracker_trace_start();
+  const char *http_keys[] = {"http.url", "http.status_code"};
+  const char *http_values[] = {"https://api.example.com/patients/42?name=jane", "200"};
+  forgeops_tracker_record_span("GET https://api.example.com/patients/42?name=jane", "http", 1700000000000LL, 1.0, http_keys, http_values, 2);
+  forgeops_tracker_record_span("/patients/42/notes", "service", 1700000000000LL, 1.0, NULL, NULL, 0);
+  const char *db_keys[] = {"rows", "db.statement"};
+  const char *db_values[] = {"3", "x"};
+  forgeops_tracker_record_span_with_sql("Load", "database", 1700000000000LL, 1.0, "SELECT * FROM patients WHERE name = 'Jane'", "postgresql", db_keys, db_values, 2);
+  usleep(20000);
+  forgeops_tracker_trace_stop(&trace, "GET /patients/42");
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  char value[64];
+  ASSERT_TRUE(span_field(body, "GET api.example.com", "kind", value, sizeof(value)) && strcmp(value, "http") == 0);
+  ASSERT_TRUE(span_field(body, "/patients/:id/notes", "kind", value, sizeof(value)));
+  ASSERT_TRUE(span_field(body, "GET /patients/:id", "kind", value, sizeof(value)) && strcmp(value, "controller") == 0);
+  ASSERT_TRUE(strstr(body, "\"data\":{\"db.statement\":\"SELECT * FROM patients WHERE name = ?\",\"db.system\":\"postgresql\"}") != NULL);
+  ASSERT_TRUE(strstr(body, "patients/42") == NULL);
+  ASSERT_TRUE(strstr(body, "jane") == NULL);
+  ASSERT_TRUE(strstr(body, "Jane") == NULL);
+  ASSERT_TRUE(strstr(body, "http.url") == NULL);
+  ASSERT_TRUE(strstr(body, "\"rows\"") == NULL);
+
+  free(body);
+  remove(body_path);
+  forgeops_tracker_reset_for_testing();
+}
+
+TEST(strict_privacy_a_performance_samples_transaction_name_keeps_a_route_but_loses_a_raw_paths_ids) {
+  char body_path[128];
+  snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-strict-%d.json", getpid());
+  pid_t child;
+  const int statuses[] = {202};
+  int port = start_capturing_test_server(statuses, 1, body_path, &child);
+  forgeops_configuration_t *config = performance_test_setup(port);
+  config->strict_privacy = 1;
+  unsigned long count;
+  double sum, max;
+
+  forgeops_tracker_record_performance("GET /patients/41", 10.0);
+  forgeops_tracker_record_performance("GET /patients/42", 20.0);
+  forgeops_tracker_record_performance("OrdersController#create", 5.0);
+  forgeops_tracker_record_performance("/charts/jane-doe-1961", 5.0);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /patients/:id", &count, &sum, &max) && count == 2);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("OrdersController#create", &count, &sum, &max) && count == 1);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("/charts/:id", &count, &sum, &max) && count == 1);
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /patients/42", &count, &sum, &max));
+  forgeops_tracker_flush_performance();
+  waitpid(child, NULL, 0);
+
+  char *body = read_whole_file(body_path);
+  ASSERT_NOT_NULL(body);
+  ASSERT_TRUE(strstr(body, "\"transaction_name\":\"GET /patients/:id\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"transaction_name\":\"OrdersController#create\"") != NULL);
+  ASSERT_TRUE(strstr(body, "jane") == NULL);
+  ASSERT_TRUE(strstr(body, "/patients/4") == NULL);
+  free(body);
+  remove(body_path);
+
+  /* Off, the name is tallied exactly as given. */
+  config = performance_test_setup(0);
+  forgeops_tracker_record_performance("GET /patients/42", 20.0);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /patients/42", &count, &sum, &max) && count == 1);
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /patients/:id", &count, &sum, &max));
+  forgeops_tracker_reset_for_testing();
+}
+
+/* Edge cases beyond the shared vectors, each checked against the server's own span_name. */
+TEST(strict_privacy_span_names_read_the_host_by_hand_like_the_server) {
+  const char *cases[][2] = {
+      {"GET ftp://files/a", "GET files"},                    /* any scheme makes it a host */
+      {"GET a@b@c.example.com/x", "GET c.example.com"},      /* everything up to the last "@" goes */
+      {"get billing/x", "GET billing/x"},                    /* no scheme, port or dot: a path */
+      {"GET host:/x", "GET host:/x"},                        /* ":" with no digits is no port */
+      {"GET :80/x", "GET :id/x"},                            /* a port and no host */
+      {"HEAD\tLOCALHOST/a", "HEAD LOCALHOST"},
+      {"GET x.y:abc/1", "GET x.y:abc"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char *name = forgeops_strict_privacy_span_name(cases[i][0]);
+    ASSERT_STREQ(name, cases[i][1]);
+    free(name);
+  }
+}
+
 int main(void) {
   RUN(sql_mask_replaces_strings_and_numbers_but_not_identifiers_or_placeholders);
   RUN(sql_mask_handles_an_escaped_quote_a_cut_off_string_and_a_dollar_quoted_body);
@@ -3360,6 +3846,17 @@ int main(void) {
   RUN(delivery_the_exit_pass_deletes_a_rejected_report_and_goes_on_but_stops_at_one_that_failed_for_now);
   RUN(crash_store_keeps_only_the_newest_twenty_and_deletes_the_rest);
   RUN(crash_store_deletes_anything_older_than_seven_days);
+
+  RUN(strict_privacy_every_fingerprint_vector_normalizes_and_hashes_exactly);
+  RUN(strict_privacy_every_path_vector_has_its_ids_taken_out);
+  RUN(strict_privacy_every_span_name_vector_keeps_only_the_method_and_host);
+  RUN(strict_privacy_span_names_read_the_host_by_hand_like_the_server);
+  RUN(strict_privacy_is_off_by_default_and_read_from_the_environment_but_code_wins);
+  RUN(strict_privacy_an_event_carries_only_structured_facts_and_a_message_fingerprint);
+  RUN(strict_privacy_off_leaves_an_event_exactly_as_before);
+  RUN(strict_privacy_records_no_breadcrumbs_and_a_crash_report_carries_no_text);
+  RUN(strict_privacy_spans_keep_the_method_and_host_and_only_database_data);
+  RUN(strict_privacy_a_performance_samples_transaction_name_keeps_a_route_but_loses_a_raw_paths_ids);
 
   printf("\n%d run, %d failed\n", g_tests_run, g_tests_failed);
   return g_tests_failed == 0 ? 0 : 1;

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.0 (2026-10-20)
+
+- New strict privacy mode, for apps that can't let personal or health data leave their own servers. Set `config->strict_privacy = 1` (or `FORGE_OPS_STRICT_PRIVACY=true`) and a report carries no message (a `message_fingerprint`, computed in this process, instead), no breadcrumbs, no SQL statement and no source context, only the user's `id`, and only the context keys named with `forgeops_configuration_set_privacy_allowed_fields` (or `FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature`). Fatal-signal crash reports follow the same rules. Span names keep an outbound call's method and host but never its path, a raw path in a span name or a performance sample's `transaction_name` loses its ids, and span data keeps only `db.statement` and `db.system`. Off by default; with it off nothing changes. See the README's "Strict privacy" section.
+
 ## 0.9.0 (2026-10-13)
 
 - A delivery the server will never accept is no longer sent again and again. A response of 4xx (other than 408 and 429) now means the payload is let go: a crash or error report file is deleted, and a batch of performance samples, metrics or infrastructure readings is dropped. A network error, a timeout, a 5xx, 408 or 429 still keeps the payload for a later try, but not for good: a batch is dropped after five failed flushes in a row, at most 20 reports wait on disk (the oldest beyond that are deleted), and a report last written more than 7 days ago is deleted. Before, any failure kept the payload, so a rejected report was uploaded at every launch and a rejected batch at every flush.

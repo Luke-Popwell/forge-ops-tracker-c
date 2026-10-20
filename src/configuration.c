@@ -28,6 +28,38 @@ static char *safe_hostname(void) {
   return dup_or_null(buf);
 }
 
+/* Splits a comma-separated list ("error_code, feature") into config->privacy_allowed_fields,
+ * trimming spaces and skipping blank entries. NULL or "" leaves the list empty. */
+static void set_privacy_allowed_fields_from_list(forgeops_configuration_t *config, const char *list) {
+  if (list == NULL || list[0] == '\0') return;
+  size_t capacity = 1;
+  for (const char *p = list; *p != '\0'; p++) {
+    if (*p == ',') capacity++;
+  }
+  config->privacy_allowed_fields = calloc(capacity, sizeof(char *));
+  if (config->privacy_allowed_fields == NULL) return;
+
+  const char *start = list;
+  for (;;) {
+    const char *end = strchr(start, ',');
+    if (end == NULL) end = start + strlen(start);
+    const char *from = start;
+    const char *to = end;
+    while (from < to && (*from == ' ' || *from == '\t')) from++;
+    while (to > from && (to[-1] == ' ' || to[-1] == '\t')) to--;
+    if (to > from) {
+      char *field = malloc((size_t)(to - from) + 1);
+      if (field != NULL) {
+        memcpy(field, from, (size_t)(to - from));
+        field[to - from] = '\0';
+        config->privacy_allowed_fields[config->privacy_allowed_field_count++] = field;
+      }
+    }
+    if (*end == '\0') break;
+    start = end + 1;
+  }
+}
+
 forgeops_configuration_t *forgeops_configuration_create(void) {
   forgeops_configuration_t *config = calloc(1, sizeof(forgeops_configuration_t));
   if (config == NULL) return NULL;
@@ -65,6 +97,11 @@ forgeops_configuration_t *forgeops_configuration_create(void) {
   config->trace_propagation_target_count = 0;
   config->timeout_seconds = 5; /* longer than the request-based clients' ~2s: see the Objective-C/Swift clients' own identical reasoning: this fires on the *next* launch after a crash, not inline with a live request */
 
+  /* Seeded here, before the caller can touch the struct, so a value set in code always wins. */
+  const char *strict_privacy = getenv("FORGE_OPS_STRICT_PRIVACY");
+  config->strict_privacy = strict_privacy != NULL && (strcasecmp(strict_privacy, "true") == 0 || strcmp(strict_privacy, "1") == 0);
+  set_privacy_allowed_fields_from_list(config, getenv("FORGE_OPS_PRIVACY_ALLOWED_FIELDS"));
+
   config->enabled_environment_count = 2;
   config->enabled_environments = calloc(2, sizeof(char *));
   if (config->enabled_environments != NULL) {
@@ -87,6 +124,7 @@ void forgeops_configuration_destroy(forgeops_configuration_t *config) {
   }
   free(config->enabled_environments);
   forgeops_configuration_set_trace_propagation_targets(config, NULL, 0);
+  forgeops_configuration_set_privacy_allowed_fields(config, NULL, 0);
   free(config);
 }
 
@@ -107,6 +145,24 @@ void forgeops_configuration_set_trace_propagation_targets(forgeops_configuration
     config->trace_propagation_targets[i] = dup_or_null(hosts[i]);
   }
   config->trace_propagation_target_count = (int)count;
+}
+
+void forgeops_configuration_set_privacy_allowed_fields(forgeops_configuration_t *config, const char **fields, size_t count) {
+  if (config == NULL) return;
+  for (int i = 0; i < config->privacy_allowed_field_count; i++) {
+    free(config->privacy_allowed_fields[i]);
+  }
+  free(config->privacy_allowed_fields);
+  config->privacy_allowed_fields = NULL;
+  config->privacy_allowed_field_count = 0;
+  if (fields == NULL || count == 0) return;
+
+  config->privacy_allowed_fields = calloc(count, sizeof(char *));
+  if (config->privacy_allowed_fields == NULL) return;
+  for (size_t i = 0; i < count; i++) {
+    config->privacy_allowed_fields[i] = dup_or_null(fields[i]);
+  }
+  config->privacy_allowed_field_count = (int)count;
 }
 
 /* host equals target, or ends with "." + target: a dot boundary, so "example.com" never matches

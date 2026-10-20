@@ -10,6 +10,7 @@
 
 #include "forgeops_tracker/client.h"
 #include "forgeops_tracker/sql_statement.h"
+#include "forgeops_tracker/strict_privacy.h"
 #include "strbuf.h"
 
 typedef struct {
@@ -100,6 +101,10 @@ static char *lowercase_trimmed(const char *value) {
  * "db.statement" value is masked with forgeops_sql_mask_for_system for the span's db.system (every
  * string and number literal becomes "?", cut at 4000 characters) and a "db.system" value is
  * lowercased, so raw SQL can never go out on a span; a blank one is left out.
+ *
+ * With strict privacy on (see strict_privacy.h), the name keeps an outbound call's method and host
+ * but never its path, a name that is a raw path ("/patients/42") has its ids taken out, and data
+ * keeps only db.statement (masked on every kind of span) and db.system.
  */
 static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *config, const char *id, const char *parent, const char *name, const char *kind, long long started_at_unix_ms, double duration_ms, const char **data_keys, const char **data_values, size_t data_count) {
   forgeops_strbuf_append_str(out, "{\"span_id\":");
@@ -111,7 +116,9 @@ static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *
     forgeops_strbuf_append_str(out, "null");
   }
   forgeops_strbuf_append_str(out, ",\"name\":");
-  append_json_string(out, name);
+  char *strict_name = config->strict_privacy ? forgeops_strict_privacy_span_name(name) : NULL;
+  append_json_string(out, strict_name != NULL ? strict_name : name);
+  free(strict_name);
   forgeops_strbuf_append_str(out, ",\"kind\":");
   append_json_string(out, normalize_kind(kind));
   forgeops_strbuf_append_str(out, ",\"started_at\":");
@@ -127,7 +134,8 @@ static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *
     forgeops_strbuf_append_str(out, "null");
   }
   forgeops_strbuf_append_str(out, ",\"data\":{");
-  int database = strcmp(normalize_kind(kind), "database") == 0;
+  int strict = config->strict_privacy;
+  int database = strict || strcmp(normalize_kind(kind), "database") == 0;
   /* The db.system that goes out with the statement, so a MySQL or MariaDB statement's "double
    * quoted" strings are masked too. */
   char *db_system = NULL;
@@ -138,6 +146,7 @@ static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *
   for (size_t i = 0; i < data_count; i++) {
     const char *value = data_values[i];
     char *owned = NULL;
+    if (strict && (data_keys[i] == NULL || (strcmp(data_keys[i], "db.statement") != 0 && strcmp(data_keys[i], "db.system") != 0))) continue;
     if (database && data_keys[i] != NULL && strcmp(data_keys[i], "db.statement") == 0) {
       owned = forgeops_sql_mask_for_system(value, db_system);
       if (owned == NULL) continue;

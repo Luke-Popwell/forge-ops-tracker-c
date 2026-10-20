@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "forgeops_tracker/client.h"
+#include "forgeops_tracker/strict_privacy.h"
 #include "strbuf.h"
 
 typedef struct {
@@ -86,6 +87,11 @@ static void ensure_worker_started(const forgeops_configuration_t *config) {
 void forgeops_performance_record(const forgeops_configuration_t *config, const char *transaction_name, double duration_ms) {
   if (config == NULL || transaction_name == NULL || !config->track_performance || !forgeops_configuration_is_enabled(config)) return;
 
+  /* Strict privacy (see strict_privacy.h): a raw path loses its ids before it names a bucket, so
+   * "GET /patients/41" and "GET /patients/42" are tallied, and sent, as one "GET /patients/:id". */
+  char *strict_name = config->strict_privacy ? forgeops_strict_privacy_transaction_name(transaction_name) : NULL;
+  if (strict_name != NULL) transaction_name = strict_name;
+
   pthread_mutex_lock(&lock);
   ensure_worker_started(config);
 
@@ -117,6 +123,7 @@ void forgeops_performance_record(const forgeops_configuration_t *config, const c
     if (duration_ms > bucket->max_duration_ms) bucket->max_duration_ms = duration_ms;
   }
   pthread_mutex_unlock(&lock);
+  free(strict_name);
 }
 
 static void append_json_string(forgeops_strbuf_t *out, const char *value) {

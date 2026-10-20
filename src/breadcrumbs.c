@@ -116,7 +116,8 @@ static char *encode_entry(const char *message, size_t message_bytes, const char 
 }
 
 void forgeops_breadcrumb_add(const forgeops_configuration_t *config, const char *message, const char *category, const char *level, const char **data_keys, const char **data_values, size_t data_count) {
-  if (config == NULL || !config->track_breadcrumbs || message == NULL) return;
+  /* Strict privacy never sends a breadcrumb, so none is recorded either. */
+  if (config == NULL || !config->track_breadcrumbs || config->strict_privacy || message == NULL) return;
   if (category == NULL) category = "custom";
   if (level == NULL) level = "info";
 

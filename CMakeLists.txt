@@ -22,6 +22,7 @@ add_library(forgeops_tracker
     src/metrics.c
     src/changes.c
     src/reporter.c
+    src/strict_privacy.c
     src/forgeops_tracker.c
 )
 target_include_directories(forgeops_tracker PUBLIC include)
@@ -34,5 +35,8 @@ target_compile_options(forgeops_tracker PRIVATE -g -fno-omit-frame-pointer -Wall
 enable_testing()
 add_executable(forgeops_tracker_tests tests/test_forgeops_tracker.c)
 target_link_libraries(forgeops_tracker_tests PRIVATE forgeops_tracker)
+# The strict privacy vectors (a byte-identical copy of sdks/strict_privacy_vectors.json) are read
+# from the source tree at test time, so the test binary runs from any working directory.
+target_compile_definitions(forgeops_tracker_tests PRIVATE FORGEOPS_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 target_compile_options(forgeops_tracker_tests PRIVATE -g -fno-omit-frame-pointer -Wall -Wextra)
 add_test(NAME forgeops_tracker_tests COMMAND forgeops_tracker_tests)

@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.9.0
+  GIT_TAG v0.10.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -535,6 +535,52 @@ never scrubbed, since redacting it would defeat the whole point of identifying u
 place.
 
 To disable it: `config->scrub_pii = 0;`
+
+## Strict privacy
+
+For apps that can't let personal or health data (PII, PHI) leave their own servers. With strict
+privacy on, a report carries only structured facts about an error, never free text that could hold
+a name, an email or a diagnosis:
+
+- `message` is sent as `""`, with a `message_fingerprint` instead: the first 32 hex characters of
+  the SHA-256 of the message with its hex object ids, UUIDs and standalone numbers taken out,
+  computed in this process. Errors still group by it, and nothing of the text can be read back.
+- `context` keeps only the keys you list in `privacy_allowed_fields`, and is left out when none
+  are there. `tags` is left out.
+- `user` keeps only `id`; never an email or a username.
+- No breadcrumbs are sent, or recorded.
+- No `sql_statement`, even with `capture_sql_statement` on. `sql_objects` (table and procedure
+  names) still goes out.
+- No source context.
+- A fatal-signal crash report follows the same rules.
+- Span names keep an outbound call's method and host, never its path or query
+  (`GET https://api.example.com/patients/42` is sent as `GET api.example.com`); a span named by a
+  raw path has its ids taken out (`/patients/42/notes` is sent as `/patients/:id/notes`). The address
+  is read by hand, never with a URL parser: its host counts as one when it has a scheme or a port, a
+  dot, or is `localhost`; otherwise the target is treated as a path. Span data keeps only
+  `db.statement` (masked) and `db.system`.
+- A performance sample's `transaction_name` follows the same rule: a route or `Controller#action`
+  is kept, and a raw path loses its ids (`GET /patients/42` is tallied and sent as
+  `GET /patients/:id`).
+
+The exception class, backtrace frames, environment, release, server name and trace id are kept, and
+metrics and changes are unchanged: they are counts and timings already. With
+strict privacy off, nothing changes at all.
+
+```c
+forgeops_configuration_t *config = forgeops_tracker_configuration();
+config->strict_privacy = 1;
+const char *allowed[] = {"error_code", "feature"};
+forgeops_configuration_set_privacy_allowed_fields(config, allowed, 2);
+```
+
+Both options are also read from the environment when the configuration is created:
+`FORGE_OPS_STRICT_PRIVACY=true` and `FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature` (comma
+separated). A value set in code wins over the environment.
+
+ForgeOps applies the same rules again on arrival when the project's own Strict privacy setting is
+on, so an app with an older or misconfigured SDK still can't get text stored for that project.
+Turning it on here as well means the text never leaves your process at all.
 
 ## Database errors
 

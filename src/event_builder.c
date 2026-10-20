@@ -26,6 +26,7 @@
 #include "forgeops_tracker/pii_scrubber.h"
 #include "forgeops_tracker/spans.h"
 #include "forgeops_tracker/sql_statement.h"
+#include "forgeops_tracker/strict_privacy.h"
 #include "strbuf.h"
 
 #define MAX_FRAMES 64
@@ -160,7 +161,7 @@ static char *truncate_line(const char *line) {
 }
 
 char *forgeops_source_context_json(const forgeops_configuration_t *config, int in_app, const char *file, long line) {
-  if (config == NULL || !config->capture_source_context || !in_app) return NULL;
+  if (config == NULL || !config->capture_source_context || config->strict_privacy || !in_app) return NULL; /* strict privacy: source is free text too */
   if (file == NULL || file[0] == '\0' || line <= 0) return NULL;
 
   FILE *f = fopen(file, "r");
@@ -316,7 +317,16 @@ char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config,
   forgeops_strbuf_append_str(&out, "{\"exception_class\":");
   json_append_string_or_null(&out, exception_class);
   forgeops_strbuf_append_str(&out, ",\"message\":");
-  json_append_string_or_null(&out, message_to_write);
+  if (config->strict_privacy) {
+    /* See strict_privacy.h: the text never leaves the process, only a one-way hash of it with its
+     * numbers and ids taken out, computed from exactly what would otherwise have been sent. */
+    char fingerprint[FORGEOPS_MESSAGE_FINGERPRINT_SIZE];
+    forgeops_strict_privacy_message_fingerprint(message_to_write, fingerprint);
+    forgeops_strbuf_append_str(&out, "\"\",\"message_fingerprint\":");
+    json_append_escaped_string(&out, fingerprint);
+  } else {
+    json_append_string_or_null(&out, message_to_write);
+  }
   forgeops_strbuf_append_str(&out, ",\"backtrace\":");
   append_backtrace_json(&out, config);
   forgeops_strbuf_append_str(&out, ",\"occurred_at\":");
@@ -328,9 +338,20 @@ char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config,
   forgeops_strbuf_append_str(&out, ",\"server_name\":");
   json_append_string_or_null(&out, config->server_name);
 
-  forgeops_strbuf_append_str(&out, ",\"context\":{");
+  /* Strict privacy keeps only the keys named in privacy_allowed_fields (every value here is a
+   * string, so each one is a plain value already) and leaves context and tags out entirely when
+   * nothing is left. */
+  size_t context_written = 0;
+  if (config->strict_privacy) {
+    for (size_t i = 0; i < context_count; i++) {
+      if (forgeops_strict_privacy_allows_field(config, context_keys[i]) && context_values[i] != NULL) context_written++;
+    }
+  }
+  if (!config->strict_privacy || context_written > 0) forgeops_strbuf_append_str(&out, ",\"context\":{");
+  context_written = 0;
   for (size_t i = 0; i < context_count; i++) {
-    if (i > 0) forgeops_strbuf_append(&out, ",", 1);
+    if (config->strict_privacy && (!forgeops_strict_privacy_allows_field(config, context_keys[i]) || context_values[i] == NULL)) continue;
+    if (context_written++ > 0) forgeops_strbuf_append(&out, ",", 1);
     json_append_escaped_string(&out, context_keys[i]);
     forgeops_strbuf_append(&out, ":", 1);
 
@@ -342,14 +363,26 @@ char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config,
     json_append_string_or_null(&out, scrubbed_value != NULL ? scrubbed_value : context_values[i]);
     free(scrubbed_value);
   }
-  forgeops_strbuf_append_str(&out, "},\"tags\":{},\"sdk_name\":\"" FORGEOPS_SDK_NAME "\"");
+  if (config->strict_privacy) {
+    if (context_written > 0) forgeops_strbuf_append(&out, "}", 1);
+    forgeops_strbuf_append_str(&out, ",\"sdk_name\":\"" FORGEOPS_SDK_NAME "\"");
+  } else {
+    forgeops_strbuf_append_str(&out, "},\"tags\":{},\"sdk_name\":\"" FORGEOPS_SDK_NAME "\"");
+  }
 
   /* Never passed through forgeops_scrub_string/forgeops_is_sensitive_key the way a context value
    * is above: a structured field the host app sets deliberately, not free text that could
    * accidentally spill sensitive data. Omitted from the wire entirely (not even an empty object)
    * when user_count is 0, the same "no key at all" shape every other client in this repo's own
    * "user" field gets when absent. */
-  if (user_count > 0) {
+  const char *user_id = forgeops_strict_privacy_user_id(user_keys, user_values, user_count);
+  if (config->strict_privacy) {
+    if (user_id != NULL) {
+      forgeops_strbuf_append_str(&out, ",\"user\":{\"id\":");
+      json_append_escaped_string(&out, user_id);
+      forgeops_strbuf_append(&out, "}", 1);
+    }
+  } else if (user_count > 0) {
     forgeops_strbuf_append_str(&out, ",\"user\":{");
     for (size_t i = 0; i < user_count; i++) {
       if (i > 0) forgeops_strbuf_append(&out, ",", 1);
@@ -360,7 +393,7 @@ char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config,
     forgeops_strbuf_append(&out, "}", 1);
   }
 
-  if (breadcrumb_count > 0 && breadcrumb_json != NULL) {
+  if (breadcrumb_count > 0 && breadcrumb_json != NULL && !config->strict_privacy) {
     forgeops_strbuf_append_str(&out, ",\"breadcrumbs\":[");
     for (size_t i = 0; i < breadcrumb_count; i++) {
       if (i > 0) forgeops_strbuf_append(&out, ",", 1);
@@ -383,7 +416,7 @@ char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config,
           free(objects);
         }
       }
-      if (config->capture_sql_statement) {
+      if (config->capture_sql_statement && !config->strict_privacy) {
         char *scrubbed_statement = config->scrub_pii ? forgeops_scrub_string(masked) : NULL;
         forgeops_strbuf_append_str(&out, ",\"sql_statement\":");
         json_append_string_or_null(&out, scrubbed_statement != NULL ? scrubbed_statement : masked);

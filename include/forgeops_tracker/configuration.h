@@ -107,10 +107,28 @@ typedef struct {
   int trace_propagation_target_count;
   int enabled_environment_count;
   char **enabled_environments;     /* array of enabled_environment_count heap strings */
+  /*
+   * Strict privacy, for apps that can't let personal or health data leave their own servers (see
+   * strict_privacy.h). Boolean: 0 = off (the default), 1 = on, seeded from
+   * FORGE_OPS_STRICT_PRIVACY=true. With it on an event carries no message (a message_fingerprint
+   * instead), breadcrumbs, SQL statement or source context, only the user's id, and only the
+   * context keys named in privacy_allowed_fields; spans keep an outbound call's method and host,
+   * never its path. Nothing else changes, and with it off nothing changes at all.
+   */
+  int strict_privacy;
+  /*
+   * The context keys strict privacy still sends, exactly as named: an array of
+   * privacy_allowed_field_count heap strings, empty by default, seeded from
+   * FORGE_OPS_PRIVACY_ALLOWED_FIELDS (comma separated, e.g. "error_code,feature"). Set it with
+   * forgeops_configuration_set_privacy_allowed_fields, which copies. Unused with strict privacy off.
+   */
+  char **privacy_allowed_fields;
+  int privacy_allowed_field_count;
 } forgeops_configuration_t;
 
 /*
- * Seeds a Configuration from FORGE_OPS_DSN/FORGE_OPS_ENVIRONMENT/FORGE_OPS_RELEASE and sensible
+ * Seeds a Configuration from FORGE_OPS_DSN/FORGE_OPS_ENVIRONMENT/FORGE_OPS_RELEASE (and
+ * FORGE_OPS_STRICT_PRIVACY/FORGE_OPS_PRIVACY_ALLOWED_FIELDS) and sensible
  * defaults for everything else: the same env vars and defaults every other client in this repo
  * reads. Returns NULL only on allocation failure.
  */
@@ -163,6 +181,12 @@ int forgeops_configuration_is_enabled(const forgeops_configuration_t *config);
  * ownership of hosts and may free it right after this returns.
  */
 void forgeops_configuration_set_trace_propagation_targets(forgeops_configuration_t *config, const char **hosts, size_t count);
+
+/*
+ * Replaces config->privacy_allowed_fields with copies of fields[0..count); NULL or a count of 0
+ * clears it. The caller keeps ownership of fields and may free it right after this returns.
+ */
+void forgeops_configuration_set_privacy_allowed_fields(forgeops_configuration_t *config, const char **fields, size_t count);
 
 /* 1 if an outgoing call to host should carry a traceparent header (see propagate_traces and
  * trace_propagation_targets), 0 otherwise. A NULL or empty host only matches with no target list. */
