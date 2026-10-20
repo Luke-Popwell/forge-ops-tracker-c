@@ -38,10 +38,17 @@ char *forgeops_strict_privacy_normalize_message(const char *message);
 int forgeops_strict_privacy_message_fingerprint(const char *message, char out[FORGEOPS_MESSAGE_FINGERPRINT_SIZE]);
 
 /*
- * A path with no query or fragment and every segment that holds an ASCII digit, or is longer than
- * 40 characters, replaced by ":id": "/patients/42/notes?q=x" is "/patients/:id/notes". An empty
- * result is "/". Newly allocated; NULL only on allocation failure.
+ * A request or page path as strict privacy sends it, with no query or fragment. A route template
+ * (any segment that starts with ":" or "*", or is wrapped in {}, <> or []) is kept as it is:
+ * "/patients/:id/notes" stays. A raw path keeps only its first segment (":id" when that holds an
+ * ASCII digit or is longer than 40 characters), then "/:path" if there was more:
+ * "/patients/jane-doe/12" is "/patients/:path", "/42/edit" is "/:id/:path". No segments at all is
+ * "/". Newly allocated; NULL only on allocation failure.
  */
+char *forgeops_strict_privacy_strict_path(const char *path);
+
+/* The name this function had before strict_path replaced its rule: the same function, kept so code
+ * built against an earlier release still links. */
 char *forgeops_strict_privacy_path_without_ids(const char *path);
 
 /*
@@ -49,16 +56,17 @@ char *forgeops_strict_privacy_path_without_ids(const char *path);
  * is "GET api.example.com". The address is read by hand, never with a URL parser: its host counts
  * as one only when the address had a scheme or a port, or the host has a dot or is "localhost"
  * ("GET localhost:3000/a/1" is "GET localhost"). Otherwise, or with a target that starts with "/",
- * the target keeps its path, ids stripped
- * ("GET /patients/42" is "GET /patients/:id"), a name that is a raw path has its ids taken out
- * ("/patients/42" is "/patients/:id"), and any other name ("OrdersController#create") is kept as
- * is. Newly allocated; NULL only on allocation failure.
+ * the target goes through forgeops_strict_privacy_strict_path ("GET /patients/42/notes" is
+ * "GET /patients/:path", "GET /patients/:id" stays), and so does a name that is a path
+ * ("/patients/jane-doe" is "/patients/:path"). Any other name ("OrdersController#create") is kept
+ * as is. Newly allocated; NULL only on allocation failure.
  */
 char *forgeops_strict_privacy_span_name(const char *name);
 
 /*
  * A performance sample's transaction_name under strict privacy: the span name rule above, so a
- * route or "Controller#action" is kept and a raw path ("GET /patients/42") loses its ids. NULL or
+ * route template or "Controller#action" is kept and a raw path keeps only its first segment
+ * ("GET /patients/42/notes" is "GET /patients/:path"). NULL or
  * "" is returned as a copy. Newly allocated; NULL only on allocation failure or a NULL name.
  */
 char *forgeops_strict_privacy_transaction_name(const char *name);

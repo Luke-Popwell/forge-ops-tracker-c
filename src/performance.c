@@ -87,8 +87,9 @@ static void ensure_worker_started(const forgeops_configuration_t *config) {
 void forgeops_performance_record(const forgeops_configuration_t *config, const char *transaction_name, double duration_ms) {
   if (config == NULL || transaction_name == NULL || !config->track_performance || !forgeops_configuration_is_enabled(config)) return;
 
-  /* Strict privacy (see strict_privacy.h): a raw path loses its ids before it names a bucket, so
-   * "GET /patients/41" and "GET /patients/42" are tallied, and sent, as one "GET /patients/:id". */
+  /* Strict privacy (see strict_privacy.h): a raw path is cut to its first segment before it names
+   * a bucket, so "GET /patients/41" and "GET /patients/42" are tallied, and sent, as one
+   * "GET /patients/:path". A route template ("GET /patients/:id") is kept. */
   char *strict_name = config->strict_privacy ? forgeops_strict_privacy_transaction_name(transaction_name) : NULL;
   if (strict_name != NULL) transaction_name = strict_name;
 

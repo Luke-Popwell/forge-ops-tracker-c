@@ -103,7 +103,7 @@ static char *lowercase_trimmed(const char *value) {
  * lowercased, so raw SQL can never go out on a span; a blank one is left out.
  *
  * With strict privacy on (see strict_privacy.h), the name keeps an outbound call's method and host
- * but never its path, a name that is a raw path ("/patients/42") has its ids taken out, and data
+ * but never its path, a raw path keeps only its first segment ("/patients/42" is "/patients/:path"), and data
  * keeps only db.statement (masked on every kind of span) and db.system.
  */
 static void append_span(forgeops_strbuf_t *out, const forgeops_configuration_t *config, const char *id, const char *parent, const char *name, const char *kind, long long started_at_unix_ms, double duration_ms, const char **data_keys, const char **data_values, size_t data_count) {

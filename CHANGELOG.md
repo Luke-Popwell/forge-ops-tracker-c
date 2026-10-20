@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.0 (2026-10-20)
+
+- **Behavior change under strict privacy: a raw request path keeps only its first segment.** A span name or performance `transaction_name` holding a raw path is now sent as its first segment plus `/:path` (`/patients/jane-doe/12` is `/patients/:path`; a first segment with a digit, or over 40 characters, is `:id`), where before only segments with a digit were replaced, so a name slug like `jane-doe` went out. A route template (any segment like `:id`, `{id}`, `<int:id>`, `[slug]` or `*path`) is kept exactly as it is. New `forgeops_strict_privacy_strict_path`; `forgeops_strict_privacy_path_without_ids` is kept as another name for it. With strict privacy off, nothing changes.
+
 ## 0.10.0 (2026-10-20)
 
 - New strict privacy mode, for apps that can't let personal or health data leave their own servers. Set `config->strict_privacy = 1` (or `FORGE_OPS_STRICT_PRIVACY=true`) and a report carries no message (a `message_fingerprint`, computed in this process, instead), no breadcrumbs, no SQL statement and no source context, only the user's `id`, and only the context keys named with `forgeops_configuration_set_privacy_allowed_fields` (or `FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature`). Fatal-signal crash reports follow the same rules. Span names keep an outbound call's method and host but never its path, a raw path in a span name or a performance sample's `transaction_name` loses its ids, and span data keeps only `db.statement` and `db.system`. Off by default; with it off nothing changes. See the README's "Strict privacy" section.

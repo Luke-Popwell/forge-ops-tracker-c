@@ -219,48 +219,75 @@ int forgeops_strict_privacy_message_fingerprint(const char *message, char out[FO
 
 #define MAX_SEGMENT_CHARACTERS 40
 
-/* Writes the segment in[start, end) to out, or ":id" when it holds an ASCII digit or is longer than
- * 40 characters (counted as UTF-8 characters, not bytes). */
-static int append_segment(forgeops_strbuf_t *out, const char *in, size_t start, size_t end) {
-  size_t characters = 0;
-  int has_digit = 0;
-  for (size_t i = start; i < end; i++) {
-    unsigned char c = (unsigned char)in[i];
-    if (is_digit(c)) has_digit = 1;
-    if ((c & 0xC0) != 0x80) characters++;
-  }
-  if (has_digit || characters > MAX_SEGMENT_CHARACTERS) return forgeops_strbuf_append_str(out, ":id");
-  return forgeops_strbuf_append(out, in + start, end - start);
+/* 1 when in[start, end) holds no newline: the server's "." never matches one. */
+static int no_newline(const char *in, size_t start, size_t end) {
+  return memchr(in + start, '\n', end - start) == NULL;
 }
 
-char *forgeops_strict_privacy_path_without_ids(const char *path) {
+/* 1 when the segment in[start, end) is a route parameter: ":id", "{id}", "<int:id>", "[slug]" or
+ * "*path" (something after the ":", something inside the brackets). */
+static int is_route_parameter(const char *in, size_t start, size_t end) {
+  size_t length = end - start;
+  const char *s = in + start;
+  if (length >= 2 && s[0] == ':') return no_newline(in, start + 1, end);
+  if (length >= 1 && s[0] == '*') return no_newline(in, start + 1, end);
+  if (length >= 3 && ((s[0] == '{' && s[length - 1] == '}') || (s[0] == '<' && s[length - 1] == '>') || (s[0] == '[' && s[length - 1] == ']'))) {
+    return no_newline(in, start + 1, end - 1);
+  }
+  return 0;
+}
+
+/* 1 when the segment in[start, end) holds an ASCII digit or is longer than 40 characters (counted
+ * as UTF-8 characters, not bytes): an id, a token or a name slug. */
+static int is_id_segment(const char *in, size_t start, size_t end) {
+  size_t characters = 0;
+  for (size_t i = start; i < end; i++) {
+    unsigned char c = (unsigned char)in[i];
+    if (is_digit(c)) return 1;
+    if ((c & 0xC0) != 0x80) characters++;
+  }
+  return characters > MAX_SEGMENT_CHARACTERS;
+}
+
+char *forgeops_strict_privacy_strict_path(const char *path) {
   if (path == NULL) path = "";
   size_t length = strcspn(path, "?#");
-  /* Trailing empty segments are dropped, the way the server's split does: "/a/" is "/a", and "/"
-   * on its own is empty, so "/" again below. */
-  while (length > 0 && path[length - 1] == '/') length--;
+
+  /* A route template is kept whole: its words are a developer's and its parameters placeholders. */
+  for (size_t start = 0; start <= length;) {
+    size_t end = start;
+    while (end < length && path[end] != '/') end++;
+    if (is_route_parameter(path, start, end)) return strndup(path, length);
+    start = end + 1;
+  }
+
+  /* A raw path keeps only its first non-empty segment: anything after it can name a person. */
+  size_t first = 0;
+  while (first < length && path[first] == '/') first++;
+  if (first == length) return strdup("/");
+  size_t first_end = first;
+  while (first_end < length && path[first_end] != '/') first_end++;
+  size_t rest = first_end;
+  while (rest < length && path[rest] == '/') rest++;
 
   forgeops_strbuf_t out;
-  if (forgeops_strbuf_init(&out, length + 16) != 0) return NULL;
-  int failed = 0;
-  if (length == 0) {
-    failed = forgeops_strbuf_append(&out, "/", 1);
+  if (forgeops_strbuf_init(&out, first_end - first + 16) != 0) return NULL;
+  int failed = path[0] == '/' && forgeops_strbuf_append(&out, "/", 1) != 0;
+  if (is_id_segment(path, first, first_end)) {
+    failed = failed || forgeops_strbuf_append_str(&out, ":id") != 0;
   } else {
-    size_t start = 0;
-    for (;;) {
-      size_t end = start;
-      while (end < length && path[end] != '/') end++;
-      failed = failed || append_segment(&out, path, start, end) != 0;
-      if (end >= length) break;
-      failed = failed || forgeops_strbuf_append(&out, "/", 1) != 0;
-      start = end + 1;
-    }
+    failed = failed || forgeops_strbuf_append(&out, path + first, first_end - first) != 0;
   }
+  if (rest < length) failed = failed || forgeops_strbuf_append_str(&out, "/:path") != 0;
   if (failed) {
     free(out.data);
     return NULL;
   }
   return out.data;
+}
+
+char *forgeops_strict_privacy_path_without_ids(const char *path) {
+  return forgeops_strict_privacy_strict_path(path);
 }
 
 static const char *const HTTP_METHODS[] = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"};
@@ -315,7 +342,7 @@ static char *host_of(const char *target, size_t target_length) {
 
 char *forgeops_strict_privacy_span_name(const char *name) {
   if (name == NULL) return NULL;
-  if (name[0] == '/') return forgeops_strict_privacy_path_without_ids(name); /* a span named by a raw path */
+  if (name[0] == '/') return forgeops_strict_privacy_strict_path(name); /* a span named by a raw path */
   size_t method_length = 0;
   const char *method = NULL;
   for (size_t m = 0; m < sizeof(HTTP_METHODS) / sizeof(HTTP_METHODS[0]); m++) {
@@ -342,7 +369,7 @@ char *forgeops_strict_privacy_span_name(const char *name) {
     forgeops_strbuf_append_str(&out, host);
   } else {
     char *target_copy = strndup(target, target_length);
-    char *path = target_copy != NULL ? forgeops_strict_privacy_path_without_ids(target_copy) : NULL;
+    char *path = target_copy != NULL ? forgeops_strict_privacy_strict_path(target_copy) : NULL;
     if (path != NULL) forgeops_strbuf_append_str(&out, path);
     free(path);
     free(target_copy);

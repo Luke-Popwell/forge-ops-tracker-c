@@ -19,7 +19,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.10.0
+  GIT_TAG v0.11.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -554,14 +554,17 @@ a name, an email or a diagnosis:
 - No source context.
 - A fatal-signal crash report follows the same rules.
 - Span names keep an outbound call's method and host, never its path or query
-  (`GET https://api.example.com/patients/42` is sent as `GET api.example.com`); a span named by a
-  raw path has its ids taken out (`/patients/42/notes` is sent as `/patients/:id/notes`). The address
+  (`GET https://api.example.com/patients/42` is sent as `GET api.example.com`). A path in a span
+  name is kept when it's a route template (a segment like `:id`, `{id}`, `<int:id>`, `[slug]` or
+  `*path`), so `/patients/:id/notes` stays; a raw path keeps only its first segment, so
+  `/patients/jane-doe/12` is sent as `/patients/:path` (and `/42/edit` as `/:id/:path`). The address
   is read by hand, never with a URL parser: its host counts as one when it has a scheme or a port, a
   dot, or is `localhost`; otherwise the target is treated as a path. Span data keeps only
   `db.statement` (masked) and `db.system`.
 - A performance sample's `transaction_name` follows the same rule: a route or `Controller#action`
-  is kept, and a raw path loses its ids (`GET /patients/42` is tallied and sent as
-  `GET /patients/:id`).
+  is kept, and a raw path keeps only its first segment (`GET /patients/42` is tallied and sent as
+  `GET /patients/:path`). Name a transaction by its route template (`GET /patients/:id`) to keep
+  it whole.
 
 The exception class, backtrace frames, environment, release, server name and trace id are kept, and
 metrics and changes are unchanged: they are counts and timings already. With

@@ -3369,14 +3369,14 @@ TEST(strict_privacy_every_fingerprint_vector_normalizes_and_hashes_exactly) {
   ASSERT_TRUE(failures == 0);
 }
 
-TEST(strict_privacy_every_path_vector_has_its_ids_taken_out) {
+TEST(strict_privacy_every_path_vector_keeps_a_route_template_and_only_a_raw_paths_first_segment) {
   vector_t vectors[MAX_VECTORS];
   int count = load_vectors("path", vectors);
   ASSERT_TRUE(count > 0);
   int expected = count_entries("path") - 1; /* the section's own key matches too */
   int failures = 0;
   for (int i = 0; i < count; i++) {
-    char *path = forgeops_strict_privacy_path_without_ids(vector_field(&vectors[i], "path"));
+    char *path = forgeops_strict_privacy_strict_path(vector_field(&vectors[i], "path"));
     if (path == NULL || strcmp(path, vector_field(&vectors[i], "strict")) != 0) {
       printf("  path \"%s\" became \"%s\"\n", vector_field(&vectors[i], "path"), path != NULL ? path : "(null)");
       failures++;
@@ -3386,6 +3386,13 @@ TEST(strict_privacy_every_path_vector_has_its_ids_taken_out) {
   free_vectors(vectors, count);
   ASSERT_TRUE(count == expected);
   ASSERT_TRUE(failures == 0);
+}
+
+/* The old name still links and still gives the same answer. */
+TEST(strict_privacy_path_without_ids_is_another_name_for_strict_path) {
+  char *path = forgeops_strict_privacy_path_without_ids("/patients/jane-doe/12");
+  ASSERT_STREQ(path, "/patients/:path");
+  free(path);
 }
 
 TEST(strict_privacy_every_span_name_vector_keeps_only_the_method_and_host) {
@@ -3618,8 +3625,8 @@ TEST(strict_privacy_spans_keep_the_method_and_host_and_only_database_data) {
   ASSERT_NOT_NULL(body);
   char value[64];
   ASSERT_TRUE(span_field(body, "GET api.example.com", "kind", value, sizeof(value)) && strcmp(value, "http") == 0);
-  ASSERT_TRUE(span_field(body, "/patients/:id/notes", "kind", value, sizeof(value)));
-  ASSERT_TRUE(span_field(body, "GET /patients/:id", "kind", value, sizeof(value)) && strcmp(value, "controller") == 0);
+  ASSERT_TRUE(span_field(body, "/patients/:path", "kind", value, sizeof(value)));
+  ASSERT_TRUE(span_field(body, "GET /patients/:path", "kind", value, sizeof(value)) && strcmp(value, "controller") == 0);
   ASSERT_TRUE(strstr(body, "\"data\":{\"db.statement\":\"SELECT * FROM patients WHERE name = ?\",\"db.system\":\"postgresql\"}") != NULL);
   ASSERT_TRUE(strstr(body, "patients/42") == NULL);
   ASSERT_TRUE(strstr(body, "jane") == NULL);
@@ -3632,7 +3639,7 @@ TEST(strict_privacy_spans_keep_the_method_and_host_and_only_database_data) {
   forgeops_tracker_reset_for_testing();
 }
 
-TEST(strict_privacy_a_performance_samples_transaction_name_keeps_a_route_but_loses_a_raw_paths_ids) {
+TEST(strict_privacy_a_performance_samples_transaction_name_keeps_a_route_but_cuts_a_raw_path_to_its_first_segment) {
   char body_path[128];
   snprintf(body_path, sizeof(body_path), "/tmp/forgeops-c-perf-strict-%d.json", getpid());
   pid_t child;
@@ -3647,16 +3654,19 @@ TEST(strict_privacy_a_performance_samples_transaction_name_keeps_a_route_but_los
   forgeops_tracker_record_performance("GET /patients/42", 20.0);
   forgeops_tracker_record_performance("OrdersController#create", 5.0);
   forgeops_tracker_record_performance("/charts/jane-doe-1961", 5.0);
-  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /patients/:id", &count, &sum, &max) && count == 2);
+  forgeops_tracker_record_performance("GET /visits/:id", 5.0);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /patients/:path", &count, &sum, &max) && count == 2);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /visits/:id", &count, &sum, &max) && count == 1);
   ASSERT_TRUE(forgeops_performance_tally_for_testing("OrdersController#create", &count, &sum, &max) && count == 1);
-  ASSERT_TRUE(forgeops_performance_tally_for_testing("/charts/:id", &count, &sum, &max) && count == 1);
+  ASSERT_TRUE(forgeops_performance_tally_for_testing("/charts/:path", &count, &sum, &max) && count == 1);
   ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /patients/42", &count, &sum, &max));
   forgeops_tracker_flush_performance();
   waitpid(child, NULL, 0);
 
   char *body = read_whole_file(body_path);
   ASSERT_NOT_NULL(body);
-  ASSERT_TRUE(strstr(body, "\"transaction_name\":\"GET /patients/:id\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"transaction_name\":\"GET /patients/:path\"") != NULL);
+  ASSERT_TRUE(strstr(body, "\"transaction_name\":\"GET /visits/:id\"") != NULL);
   ASSERT_TRUE(strstr(body, "\"transaction_name\":\"OrdersController#create\"") != NULL);
   ASSERT_TRUE(strstr(body, "jane") == NULL);
   ASSERT_TRUE(strstr(body, "/patients/4") == NULL);
@@ -3667,7 +3677,7 @@ TEST(strict_privacy_a_performance_samples_transaction_name_keeps_a_route_but_los
   config = performance_test_setup(0);
   forgeops_tracker_record_performance("GET /patients/42", 20.0);
   ASSERT_TRUE(forgeops_performance_tally_for_testing("GET /patients/42", &count, &sum, &max) && count == 1);
-  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /patients/:id", &count, &sum, &max));
+  ASSERT_TRUE(!forgeops_performance_tally_for_testing("GET /patients/:path", &count, &sum, &max));
   forgeops_tracker_reset_for_testing();
 }
 
@@ -3676,11 +3686,15 @@ TEST(strict_privacy_span_names_read_the_host_by_hand_like_the_server) {
   const char *cases[][2] = {
       {"GET ftp://files/a", "GET files"},                    /* any scheme makes it a host */
       {"GET a@b@c.example.com/x", "GET c.example.com"},      /* everything up to the last "@" goes */
-      {"get billing/x", "GET billing/x"},                    /* no scheme, port or dot: a path */
-      {"GET host:/x", "GET host:/x"},                        /* ":" with no digits is no port */
-      {"GET :80/x", "GET :id/x"},                            /* a port and no host */
+      {"get billing/x", "GET billing/:path"},                /* no scheme, port or dot: a path */
+      {"GET host:/x", "GET host:/:path"},                    /* ":" with no digits is no port */
+      {"GET :80/x", "GET :80/x"},                            /* no host, and ":80" reads as a route parameter */
       {"HEAD\tLOCALHOST/a", "HEAD LOCALHOST"},
       {"GET x.y:abc/1", "GET x.y:abc"},
+      {"*", "*"},                                            /* a route template on its own */
+      {"/a/:", "/a/:path"},                                  /* a parameter needs a name */
+      {"/a/{}", "/a/:path"},
+      {"/a/:x\ny", "/a/:path"},                              /* the server's "." never matches a newline */
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     char *name = forgeops_strict_privacy_span_name(cases[i][0]);
@@ -3848,7 +3862,8 @@ int main(void) {
   RUN(crash_store_deletes_anything_older_than_seven_days);
 
   RUN(strict_privacy_every_fingerprint_vector_normalizes_and_hashes_exactly);
-  RUN(strict_privacy_every_path_vector_has_its_ids_taken_out);
+  RUN(strict_privacy_every_path_vector_keeps_a_route_template_and_only_a_raw_paths_first_segment);
+  RUN(strict_privacy_path_without_ids_is_another_name_for_strict_path);
   RUN(strict_privacy_every_span_name_vector_keeps_only_the_method_and_host);
   RUN(strict_privacy_span_names_read_the_host_by_hand_like_the_server);
   RUN(strict_privacy_is_off_by_default_and_read_from_the_environment_but_code_wins);
@@ -3856,7 +3871,7 @@ int main(void) {
   RUN(strict_privacy_off_leaves_an_event_exactly_as_before);
   RUN(strict_privacy_records_no_breadcrumbs_and_a_crash_report_carries_no_text);
   RUN(strict_privacy_spans_keep_the_method_and_host_and_only_database_data);
-  RUN(strict_privacy_a_performance_samples_transaction_name_keeps_a_route_but_loses_a_raw_paths_ids);
+  RUN(strict_privacy_a_performance_samples_transaction_name_keeps_a_route_but_cuts_a_raw_path_to_its_first_segment);
 
   printf("\n%d run, %d failed\n", g_tests_run, g_tests_failed);
   return g_tests_failed == 0 ? 0 : 1;
