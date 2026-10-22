@@ -3,6 +3,8 @@
 Plain C error/crash reporting client for [ForgeOps](https://getforgeops.net). Requires a POSIX
 platform (macOS, Linux): see "Platform" below. Targets C11.
 
+> For health or personal data, turn on [strict privacy](#strict-privacy): the SDK then sends only structured facts about each error (its type, stack trace, release and route), never the message, a raw path, breadcrumbs, or context you haven't allowed.
+
 This is a crash reporter, not a web-framework middleware: plain C has no exceptions and no web
 framework of its own to hook a request-exception path into. Plain C has no exceptions at all, so
 the only "automatic capture" story that actually exists here is a fatal-signal handler: see
@@ -19,7 +21,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.11.0
+  GIT_TAG v0.11.1
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
