@@ -319,7 +319,7 @@ char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config,
   forgeops_strbuf_append_str(&out, ",\"message\":");
   if (config->strict_privacy) {
     /* See strict_privacy.h: the text never leaves the process, only a one-way hash of it with its
-     * numbers and ids taken out, computed from exactly what would otherwise have been sent. */
+     * numbers, ids, emails and quoted values taken out, computed from exactly what would otherwise have been sent. */
     char fingerprint[FORGEOPS_MESSAGE_FINGERPRINT_SIZE];
     forgeops_strict_privacy_message_fingerprint(message_to_write, fingerprint);
     forgeops_strbuf_append_str(&out, "\"\",\"message_fingerprint\":");

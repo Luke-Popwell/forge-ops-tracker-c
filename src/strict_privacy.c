@@ -106,7 +106,97 @@ static int is_hex(unsigned char c) {
   return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-/* Step 2: "0x" followed by 4 or more hex digits becomes "0x". */
+static int is_alpha(unsigned char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static int is_email_local(unsigned char c) {
+  return is_alpha(c) || is_digit(c) || c == '.' || c == '_' || c == '%' || c == '+' || c == '-';
+}
+
+static int is_email_domain(unsigned char c) {
+  return is_alpha(c) || is_digit(c) || c == '.' || c == '-';
+}
+
+/*
+ * The length of the email [a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,} starting at in[at], or 0,
+ * as a backtracking engine matches it. '@' isn't a local-part character, so the local part is the
+ * whole run before it. The domain takes its whole run, then gives characters back until what's left
+ * ends in "." plus 2 or more letters, and those letters take as many as they can. *local_end is
+ * where the local-part run starts failing: no start inside the run can match either, since each one
+ * reaches the same '@' and the same domain.
+ */
+static size_t email_at(const char *in, size_t at, size_t *local_end) {
+  size_t at_sign = at;
+  while (is_email_local((unsigned char)in[at_sign])) at_sign++;
+  *local_end = at_sign;
+  if (at_sign == at || in[at_sign] != '@') return 0;
+  size_t domain_start = at_sign + 1;
+  size_t domain_end = domain_start;
+  while (is_email_domain((unsigned char)in[domain_end])) domain_end++;
+  for (size_t dot = domain_end; dot > domain_start + 1; dot--) {
+    size_t d = dot - 1;
+    if (in[d] != '.') continue;
+    size_t letters = 0;
+    while (is_alpha((unsigned char)in[d + 1 + letters])) letters++;
+    if (letters >= 2) return d + 1 + letters - at;
+  }
+  return 0;
+}
+
+/* Step 2: an email becomes "<email>". */
+static int replace_emails(const char *in, forgeops_strbuf_t *out) {
+  size_t i = 0;
+  while (in[i] != '\0') {
+    size_t local_end = i;
+    size_t length = is_email_local((unsigned char)in[i]) ? email_at(in, i, &local_end) : 0;
+    if (length > 0) {
+      if (forgeops_strbuf_append_str(out, "<email>") != 0) return -1;
+      i += length;
+      continue;
+    }
+    size_t copy = local_end > i ? local_end - i : 1;
+    if (forgeops_strbuf_append(out, in + i, copy) != 0) return -1;
+    i += copy;
+  }
+  return 0;
+}
+
+/*
+ * Each run of quote, then any bytes but quote, CR or LF, then quote, becomes "<str>". With
+ * at_word_boundary, the opening quote can't directly follow an ASCII word character and the closing
+ * one can't directly precede one; an opener whose closer fails that has no match, and the scan
+ * moves on to the next byte.
+ */
+static int replace_quoted(const char *in, forgeops_strbuf_t *out, char quote, int at_word_boundary) {
+  size_t i = 0;
+  while (in[i] != '\0') {
+    if (in[i] == quote && (!at_word_boundary || i == 0 || !is_word((unsigned char)in[i - 1]))) {
+      size_t end = i + 1;
+      while (in[end] != '\0' && in[end] != quote && in[end] != '\r' && in[end] != '\n') end++;
+      if (in[end] == quote && (!at_word_boundary || !is_word((unsigned char)in[end + 1]))) {
+        if (forgeops_strbuf_append_str(out, "<str>") != 0) return -1;
+        i = end + 1;
+        continue;
+      }
+    }
+    if (forgeops_strbuf_append(out, in + i, 1) != 0) return -1;
+    i++;
+  }
+  return 0;
+}
+
+/* Step 3: a double-quoted run becomes "<str>". */
+static int replace_double_quoted(const char *in, forgeops_strbuf_t *out) {
+  return replace_quoted(in, out, '"', 0);
+}
+
+/* Step 4: a single-quoted run, its quotes at ASCII word boundaries, becomes "<str>". */
+static int replace_single_quoted(const char *in, forgeops_strbuf_t *out) {
+  return replace_quoted(in, out, '\'', 1);
+}
+
+/* Step 5: "0x" followed by 4 or more hex digits becomes "0x". */
 static int replace_hex_object_ids(const char *in, forgeops_strbuf_t *out) {
   size_t i = 0;
   while (in[i] != '\0') {
@@ -143,7 +233,7 @@ static int uuid_at(const char *in, size_t at) {
 
 #define UUID_LENGTH 36
 
-/* Step 3: a UUID with no ASCII word character directly before or after it becomes "<uuid>". */
+/* Step 6: a UUID with no ASCII word character directly before or after it becomes "<uuid>". */
 static int replace_uuids(const char *in, forgeops_strbuf_t *out) {
   size_t i = 0;
   while (in[i] != '\0') {
@@ -159,7 +249,7 @@ static int replace_uuids(const char *in, forgeops_strbuf_t *out) {
   return 0;
 }
 
-/* Step 4: a run of ASCII digits with no ASCII word character directly before or after it becomes
+/* Step 7: a run of ASCII digits with no ASCII word character directly before or after it becomes
  * "<n>". A run that touches one is copied whole: no shorter part of it can match either, since the
  * rest of the run is itself a word character. */
 static int replace_numbers(const char *in, forgeops_strbuf_t *out) {
@@ -182,9 +272,11 @@ static int replace_numbers(const char *in, forgeops_strbuf_t *out) {
 }
 
 char *forgeops_strict_privacy_normalize_message(const char *message) {
-  int (*const steps[3])(const char *, forgeops_strbuf_t *) = {replace_hex_object_ids, replace_uuids, replace_numbers};
+  int (*const steps[])(const char *, forgeops_strbuf_t *) = {replace_emails, replace_double_quoted, replace_single_quoted,
+                                                            replace_hex_object_ids, replace_uuids, replace_numbers};
+  const int step_count = (int)(sizeof(steps) / sizeof(steps[0]));
   char *current = strdup(message != NULL ? message : "");
-  for (int step = 0; current != NULL && step < 3; step++) {
+  for (int step = 0; current != NULL && step < step_count; step++) {
     forgeops_strbuf_t out;
     if (forgeops_strbuf_init(&out, strlen(current) + 16) != 0) {
       free(current);
@@ -294,10 +386,6 @@ static const char *const HTTP_METHODS[] = {"GET", "POST", "PUT", "PATCH", "DELET
 
 static int is_space(unsigned char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
-}
-
-static int is_alpha(unsigned char c) {
-  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
 
 /* The length of a leading "scheme://" (any scheme: a letter, then letters, digits, "+", "." or

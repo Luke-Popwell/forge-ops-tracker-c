@@ -23,11 +23,13 @@
 #define FORGEOPS_MESSAGE_FINGERPRINT_SIZE (FORGEOPS_MESSAGE_FINGERPRINT_LENGTH + 1)
 
 /*
- * The message with every "0x" plus 4 or more hex digits cut to "0x", then every UUID and every
- * standalone run of ASCII digits replaced by "<uuid>" and "<n>", in that order. "Standalone" means
- * not touching an ASCII letter, digit or underscore: a byte scan over the UTF-8 text, so a digit or
- * letter in another script never counts as one. NULL is treated as "". Newly allocated; NULL only
- * on allocation failure.
+ * The message with every email replaced by "<email>", every double-quoted run and then every
+ * single-quoted run (quotes included, never across a line break) by "<str>", every "0x" plus 4 or
+ * more hex digits cut to "0x", then every UUID and every standalone run of ASCII digits replaced by
+ * "<uuid>" and "<n>", in that order. A single quote only opens or closes a run where it doesn't
+ * touch an ASCII letter, digit or underscore on the outside, and "standalone" means not touching
+ * one at all: a byte scan over the UTF-8 text, so a digit or letter in another script never counts
+ * as one. NULL is treated as "". Newly allocated; NULL only on allocation failure.
  */
 char *forgeops_strict_privacy_normalize_message(const char *message);
 
