@@ -3276,14 +3276,29 @@ static char *vector_read_string(vector_reader_t *r) {
   return out;
 }
 
-static char *read_vectors_file(void) {
-  return read_whole_file(FORGEOPS_TEST_FIXTURES_DIR "/strict_privacy_vectors.json");
+#define STRICT_PRIVACY_VECTORS "strict_privacy_vectors.json"
+
+/* file is a name in tests/fixtures. */
+static char *read_vectors_file(const char *file) {
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/%s", FORGEOPS_TEST_FIXTURES_DIR, file);
+  return read_whole_file(path);
 }
 
-/* Reads the array under "section" into vectors (each a flat object of strings); returns how many,
- * or -1 if the file or section is missing or the file isn't the expected shape. */
-static int load_vectors(const char *section, vector_t *vectors) {
-  char *text = read_vectors_file();
+/* A JSON value at r->at that is a string, true or false (read as "true" and "false"), as a new
+ * string; NULL for anything else. */
+static char *vector_read_value(vector_reader_t *r) {
+  vector_skip_space(r);
+  if (strncmp(r->at, "true", 4) == 0) { r->at += 4; return strdup("true"); }
+  if (strncmp(r->at, "false", 5) == 0) { r->at += 5; return strdup("false"); }
+  return vector_read_string(r);
+}
+
+/* Reads the array under "section" of file into vectors (each a flat object of strings and
+ * booleans); returns how many, or -1 if the file or section is missing or the file isn't the
+ * expected shape. */
+static int load_vectors_from(const char *file, const char *section, vector_t *vectors) {
+  char *text = read_vectors_file(file);
   if (text == NULL) return -1;
   char needle[64];
   snprintf(needle, sizeof(needle), "\"%s\":", section);
@@ -3308,7 +3323,7 @@ static int load_vectors(const char *section, vector_t *vectors) {
       char *key = vector_read_string(&r);
       vector_skip_space(&r);
       if (key == NULL || *r.at++ != ':' || v->count == MAX_VECTOR_FIELDS) { free(key); free(text); return -1; }
-      char *value = vector_read_string(&r);
+      char *value = vector_read_value(&r);
       if (value == NULL) { free(key); free(text); return -1; }
       v->keys[v->count] = key;
       v->values[v->count++] = value;
@@ -3316,6 +3331,10 @@ static int load_vectors(const char *section, vector_t *vectors) {
   }
   free(text);
   return count;
+}
+
+static int load_vectors(const char *section, vector_t *vectors) {
+  return load_vectors_from(STRICT_PRIVACY_VECTORS, section, vectors);
 }
 
 static const char *vector_field(const vector_t *v, const char *key) {
@@ -3336,8 +3355,8 @@ static void free_vectors(vector_t *vectors, int count) {
 
 /* How many entries the section has in the file, counted independently of load_vectors (by the
  * one key every entry of it carries), so a reader bug can't quietly skip an entry. */
-static int count_entries(const char *first_key) {
-  char *text = read_vectors_file();
+static int count_entries_in(const char *file, const char *first_key) {
+  char *text = read_vectors_file(file);
   if (text == NULL) return -1;
   char needle[64];
   snprintf(needle, sizeof(needle), "\"%s\":", first_key);
@@ -3345,6 +3364,54 @@ static int count_entries(const char *first_key) {
   for (const char *p = strstr(text, needle); p != NULL; p = strstr(p + 1, needle)) count++;
   free(text);
   return count;
+}
+
+static int count_entries(const char *first_key) {
+  return count_entries_in(STRICT_PRIVACY_VECTORS, first_key);
+}
+
+/* PII scrubbing vectors: tests/fixtures/pii_scrubbing_vectors.json, a byte-identical copy of
+ * sdks/pii_scrubbing_vectors.json, generated from the server's own scrubber (see
+ * sdks/PII_SCRUBBING.md). Read with the same small reader as the strict privacy vectors above. */
+#define PII_SCRUBBING_VECTORS "pii_scrubbing_vectors.json"
+
+TEST(pii_every_scrubbing_string_vector_scrubs_exactly) {
+  vector_t vectors[MAX_VECTORS];
+  int count = load_vectors_from(PII_SCRUBBING_VECTORS, "strings", vectors);
+  ASSERT_TRUE(count > 0);
+  int expected = count_entries_in(PII_SCRUBBING_VECTORS, "scrubbed");
+  int failures = 0;
+  for (int i = 0; i < count; i++) {
+    const char *input = vector_field(&vectors[i], "input");
+    char *scrubbed = forgeops_scrub_string(input);
+    if (scrubbed == NULL || strcmp(scrubbed, vector_field(&vectors[i], "scrubbed")) != 0) {
+      printf("  \"%s\" scrubbed to \"%s\"\n", input, scrubbed != NULL ? scrubbed : "(null)");
+      failures++;
+    }
+    free(scrubbed);
+  }
+  free_vectors(vectors, count);
+  ASSERT_TRUE(count == expected);
+  ASSERT_TRUE(failures == 0);
+}
+
+TEST(pii_every_scrubbing_key_vector_is_sensitive_exactly_when_redacted) {
+  vector_t vectors[MAX_VECTORS];
+  int count = load_vectors_from(PII_SCRUBBING_VECTORS, "keys", vectors);
+  ASSERT_TRUE(count > 0);
+  int expected = count_entries_in(PII_SCRUBBING_VECTORS, "redacted");
+  int failures = 0;
+  for (int i = 0; i < count; i++) {
+    const char *key = vector_field(&vectors[i], "key");
+    int redacted = strcmp(vector_field(&vectors[i], "redacted"), "true") == 0;
+    if (forgeops_is_sensitive_key(key) != redacted) {
+      printf("  key \"%s\": sensitive %d, want %d\n", key, forgeops_is_sensitive_key(key), redacted);
+      failures++;
+    }
+  }
+  free_vectors(vectors, count);
+  ASSERT_TRUE(count == expected);
+  ASSERT_TRUE(failures == 0);
 }
 
 TEST(strict_privacy_every_fingerprint_vector_normalizes_and_hashes_exactly) {
@@ -3727,6 +3794,8 @@ int main(void) {
   RUN(pii_scrub_ssn);
   RUN(pii_scrub_known_token_formats);
   RUN(pii_is_sensitive_key_ignores_case_and_punctuation);
+  RUN(pii_every_scrubbing_string_vector_scrubs_exactly);
+  RUN(pii_every_scrubbing_key_vector_is_sensitive_exactly_when_redacted);
 
   RUN(event_builder_basic_fields);
   RUN(event_builder_scrubs_message_and_context_by_default);
