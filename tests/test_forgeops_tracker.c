@@ -3209,7 +3209,7 @@ TEST(crash_store_deletes_anything_older_than_seven_days) {
 /*
  * The vectors are read straight from tests/fixtures/strict_privacy_vectors.json (a byte-identical
  * copy of sdks/strict_privacy_vectors.json, generated from the server's own implementation), so
- * this suite can never drift from them. That file is a fixed shape: an object of three arrays of
+ * this suite can never drift from them. That file is a fixed shape: an object of arrays of
  * flat objects whose values are all strings, so a small reader for exactly that shape stands in
  * for a JSON library this SDK doesn't otherwise need.
  */
@@ -3481,17 +3481,46 @@ TEST(strict_privacy_every_span_name_vector_keeps_only_the_method_and_host) {
   ASSERT_TRUE(failures == 0);
 }
 
+TEST(strict_privacy_every_user_id_vector_hashes_exactly) {
+  vector_t vectors[MAX_VECTORS];
+  int count = load_vectors("user_id", vectors);
+  ASSERT_TRUE(count > 0);
+  int expected = count_entries("hashed");
+  int failures = 0;
+  for (int i = 0; i < count; i++) {
+    char hashed[FORGEOPS_HASHED_USER_ID_SIZE];
+    forgeops_strict_privacy_hashed_user_id(vector_field(&vectors[i], "id"), vector_field(&vectors[i], "key"), hashed);
+    if (strlen(hashed) != FORGEOPS_HASHED_USER_ID_LENGTH || strcmp(hashed, vector_field(&vectors[i], "hashed")) != 0) {
+      printf("  user id \"%s\" with key \"%s\" hashed to \"%s\"\n", vector_field(&vectors[i], "id"), vector_field(&vectors[i], "key"), hashed);
+      failures++;
+    }
+  }
+  free_vectors(vectors, count);
+  ASSERT_TRUE(count == expected);
+  ASSERT_TRUE(failures == 0);
+}
+
 TEST(strict_privacy_is_off_by_default_and_read_from_the_environment_but_code_wins) {
   forgeops_configuration_t *config = forgeops_configuration_create();
   ASSERT_TRUE(config->strict_privacy == 0);
   ASSERT_TRUE(config->privacy_allowed_field_count == 0);
+  ASSERT_NULL(config->privacy_user_key);
+  forgeops_configuration_destroy(config);
+
+  setenv("FORGE_OPS_PRIVACY_USER_KEY", "", 1); /* empty counts as unset */
+  config = forgeops_configuration_create();
+  unsetenv("FORGE_OPS_PRIVACY_USER_KEY");
+  ASSERT_NULL(config->privacy_user_key);
   forgeops_configuration_destroy(config);
 
   setenv("FORGE_OPS_STRICT_PRIVACY", "true", 1);
   setenv("FORGE_OPS_PRIVACY_ALLOWED_FIELDS", "error_code, feature,,", 1);
+  setenv("FORGE_OPS_PRIVACY_USER_KEY", "customer-secret", 1);
   config = forgeops_configuration_create();
   unsetenv("FORGE_OPS_STRICT_PRIVACY");
   unsetenv("FORGE_OPS_PRIVACY_ALLOWED_FIELDS");
+  unsetenv("FORGE_OPS_PRIVACY_USER_KEY");
+  ASSERT_STREQ(config->privacy_user_key, "customer-secret");
   ASSERT_TRUE(config->strict_privacy == 1);
   ASSERT_TRUE(config->privacy_allowed_field_count == 2);
   ASSERT_STREQ(config->privacy_allowed_fields[0], "error_code");
@@ -3505,6 +3534,10 @@ TEST(strict_privacy_is_off_by_default_and_read_from_the_environment_but_code_win
   forgeops_configuration_set_privacy_allowed_fields(config, fields, 1);
   ASSERT_TRUE(config->privacy_allowed_field_count == 1);
   ASSERT_STREQ(config->privacy_allowed_fields[0], "tenant");
+  forgeops_configuration_set_privacy_user_key(config, "another-key");
+  ASSERT_STREQ(config->privacy_user_key, "another-key");
+  forgeops_configuration_set_privacy_user_key(config, "");
+  ASSERT_NULL(config->privacy_user_key);
   forgeops_configuration_destroy(config);
 
   setenv("FORGE_OPS_STRICT_PRIVACY", "no", 1);
@@ -3537,6 +3570,7 @@ TEST(strict_privacy_an_event_carries_only_structured_facts_and_a_message_fingerp
   config->capture_sql_statement = 1;
   const char *fields[] = {"error_code", "count"};
   forgeops_configuration_set_privacy_allowed_fields(config, fields, 2);
+  forgeops_configuration_set_privacy_user_key(config, "customer-secret");
 
   char *json = build_private_event(config);
   ASSERT_NOT_NULL(json);
@@ -3547,7 +3581,8 @@ TEST(strict_privacy_an_event_carries_only_structured_facts_and_a_message_fingerp
   ASSERT_TRUE(strstr(json, "\"context\":{\"error_code\":\"E42\",\"count\":\"3\"}") != NULL);
   ASSERT_TRUE(strstr(json, "Jane") == NULL); /* not in context, breadcrumbs or the SQL statement */
   ASSERT_TRUE(strstr(json, "\"tags\"") == NULL);
-  ASSERT_TRUE(strstr(json, "\"user\":{\"id\":\"42\"}") != NULL);
+  ASSERT_TRUE(strstr(json, "\"user\":{\"id\":\"h1:316d4a35bc95112698f59ef5aac5c29a\"}") != NULL);
+  ASSERT_TRUE(strstr(json, "\"42\"") == NULL);
   ASSERT_TRUE(strstr(json, "jane@example.com") == NULL);
   ASSERT_TRUE(strstr(json, "jdoe") == NULL);
   ASSERT_TRUE(strstr(json, "\"breadcrumbs\"") == NULL);
@@ -3570,6 +3605,23 @@ TEST(strict_privacy_an_event_carries_only_structured_facts_and_a_message_fingerp
   ASSERT_TRUE(strstr(json, "\"context\"") == NULL);
   ASSERT_TRUE(strstr(json, "\"user\"") == NULL);
   ASSERT_TRUE(strstr(json, "\"message_fingerprint\":\"e3b0c44298fc1c149afbf4c8996fb924\"") != NULL); /* an absent message is "" */
+  free(json);
+
+  /* With no key (never set, or set to ""), no user is sent at all, not even its id; a blank id
+   * isn't sent even with a key. */
+  const char *id_keys[] = {"id"};
+  const char *blank_id[] = {"  "};
+  json = forgeops_build_event_json(config, "MyError", NULL, NULL, NULL, 0, id_keys, blank_id, 1, NULL, 0);
+  ASSERT_TRUE(strstr(json, "\"user\"") == NULL);
+  free(json);
+  forgeops_configuration_set_privacy_user_key(config, NULL);
+  json = build_private_event(config);
+  ASSERT_TRUE(strstr(json, "\"user\"") == NULL);
+  ASSERT_TRUE(strstr(json, "\"42\"") == NULL);
+  free(json);
+  config->privacy_user_key = strdup("");
+  json = build_private_event(config);
+  ASSERT_TRUE(strstr(json, "\"user\"") == NULL);
   free(json);
 
   /* Source context is off under strict privacy, even for a real in-app file and line. */
@@ -3615,6 +3667,7 @@ TEST(strict_privacy_records_no_breadcrumbs_and_a_crash_report_carries_no_text) {
   char dir[256];
   forgeops_configuration_t *config = breadcrumb_test_setup("strict", dir, sizeof(dir));
   config->strict_privacy = 1;
+  forgeops_configuration_set_privacy_user_key(config, "customer-secret");
   const char *user_keys[] = {"id", "email"};
   const char *user_values[] = {"7", "jane@example.com"};
   forgeops_tracker_set_user(user_keys, user_values, 2);
@@ -3659,7 +3712,7 @@ TEST(strict_privacy_records_no_breadcrumbs_and_a_crash_report_carries_no_text) {
   ASSERT_TRUE(strstr(json, "Uncaught") == NULL);
   ASSERT_TRUE(strstr(json, "\"breadcrumbs\"") == NULL);
   ASSERT_TRUE(strstr(json, "\"context\"") == NULL);
-  ASSERT_TRUE(strstr(json, "\"user\":{\"id\":\"7\"}") != NULL);
+  ASSERT_TRUE(strstr(json, "\"user\":{\"id\":\"h1:3b16f5beb95b719e7d59549b34554da5\"}") != NULL);
   ASSERT_TRUE(strstr(json, "jane@example.com") == NULL);
 
   free(json);
@@ -3935,6 +3988,7 @@ int main(void) {
   RUN(strict_privacy_path_without_ids_is_another_name_for_strict_path);
   RUN(strict_privacy_every_span_name_vector_keeps_only_the_method_and_host);
   RUN(strict_privacy_span_names_read_the_host_by_hand_like_the_server);
+  RUN(strict_privacy_every_user_id_vector_hashes_exactly);
   RUN(strict_privacy_is_off_by_default_and_read_from_the_environment_but_code_wins);
   RUN(strict_privacy_an_event_carries_only_structured_facts_and_a_message_fingerprint);
   RUN(strict_privacy_off_leaves_an_event_exactly_as_before);

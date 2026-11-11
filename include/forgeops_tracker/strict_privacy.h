@@ -9,10 +9,11 @@
  * Strict privacy (config->strict_privacy): for apps that can't let personal or health data leave
  * their own servers. With it on, an event carries only structured facts about an error, never free
  * text: no message (a message_fingerprint instead), no breadcrumbs, no SQL statement, no source
- * context, only the user's id, and only the context keys named in privacy_allowed_fields. Span
- * names keep an outbound call's method and host but never its path, and span data keeps only
- * db.statement and db.system. The server applies the same rules again on arrival for a project
- * with its own Strict privacy setting on; doing it here means the text never leaves the process.
+ * context, the user's id only as a keyed hash (privacy_user_key), and only the context keys named
+ * in privacy_allowed_fields. Span names keep an outbound call's method and host but never its
+ * path, and span data keeps only db.statement and db.system. The server applies the same rules
+ * again on arrival for a project with its own Strict privacy setting on; doing it here means the
+ * text never leaves the process.
  *
  * Every function below is the exact algorithm in sdks/STRICT_PRIVACY.md, pinned by
  * sdks/strict_privacy_vectors.json (tests/fixtures/strict_privacy_vectors.json is a copy).
@@ -73,10 +74,30 @@ char *forgeops_strict_privacy_span_name(const char *name);
  */
 char *forgeops_strict_privacy_transaction_name(const char *name);
 
+/* A hashed user id: "h1:" and 32 hex characters, plus the NUL. */
+#define FORGEOPS_HASHED_USER_ID_LENGTH (3 + FORGEOPS_MESSAGE_FINGERPRINT_LENGTH)
+#define FORGEOPS_HASHED_USER_ID_SIZE (FORGEOPS_HASHED_USER_ID_LENGTH + 1)
+
 /*
- * The value under the "id" key of a user's parallel key/value arrays, the one user field strict
- * privacy sends (never email or username), or NULL when there is no id or it's blank. Borrowed
- * from user_values, not copied.
+ * "h1:" and the first 32 lowercase hex characters of HMAC-SHA256 of id's UTF-8 bytes, keyed with
+ * key's UTF-8 bytes (a key longer than 64 bytes is hashed first, as HMAC specifies), written to out
+ * (NUL-terminated). A raw id can be a record number that identifies a person, and an unkeyed hash
+ * of a small number can be guessed back; the same id still hashes the same under one key, so
+ * affected customers can be counted. NULL is treated as "". Allocates nothing.
+ */
+void forgeops_strict_privacy_hashed_user_id(const char *id, const char *key, char out[FORGEOPS_HASHED_USER_ID_SIZE]);
+
+/*
+ * The one user field strict privacy sends: the user's id (forgeops_strict_privacy_user_id) hashed
+ * with config->privacy_user_key, written to out, returning 1. Returns 0, with out "", when there is
+ * no key (NULL or "") or no id, and then no user is sent at all.
+ */
+int forgeops_strict_privacy_user(const forgeops_configuration_t *config, const char **user_keys, const char **user_values, size_t user_count, char out[FORGEOPS_HASHED_USER_ID_SIZE]);
+
+/*
+ * The value under the "id" key of a user's parallel key/value arrays, or NULL when there is no id
+ * or it's blank. Strict privacy never sends it as it is, only hashed (forgeops_strict_privacy_user).
+ * Borrowed from user_values, not copied.
  */
 const char *forgeops_strict_privacy_user_id(const char **user_keys, const char **user_values, size_t user_count);
 

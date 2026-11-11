@@ -101,6 +101,7 @@ forgeops_configuration_t *forgeops_configuration_create(void) {
   const char *strict_privacy = getenv("FORGE_OPS_STRICT_PRIVACY");
   config->strict_privacy = strict_privacy != NULL && (strcasecmp(strict_privacy, "true") == 0 || strcmp(strict_privacy, "1") == 0);
   set_privacy_allowed_fields_from_list(config, getenv("FORGE_OPS_PRIVACY_ALLOWED_FIELDS"));
+  config->privacy_user_key = dup_env_or("FORGE_OPS_PRIVACY_USER_KEY", NULL);
 
   config->enabled_environment_count = 2;
   config->enabled_environments = calloc(2, sizeof(char *));
@@ -125,6 +126,7 @@ void forgeops_configuration_destroy(forgeops_configuration_t *config) {
   free(config->enabled_environments);
   forgeops_configuration_set_trace_propagation_targets(config, NULL, 0);
   forgeops_configuration_set_privacy_allowed_fields(config, NULL, 0);
+  free(config->privacy_user_key);
   free(config);
 }
 
@@ -163,6 +165,12 @@ void forgeops_configuration_set_privacy_allowed_fields(forgeops_configuration_t 
     config->privacy_allowed_fields[i] = dup_or_null(fields[i]);
   }
   config->privacy_allowed_field_count = (int)count;
+}
+
+void forgeops_configuration_set_privacy_user_key(forgeops_configuration_t *config, const char *key) {
+  if (config == NULL) return;
+  free(config->privacy_user_key);
+  config->privacy_user_key = (key == NULL || key[0] == '\0') ? NULL : dup_or_null(key);
 }
 
 /* host equals target, or ends with "." + target: a dot boundary, so "example.com" never matches

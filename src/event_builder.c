@@ -375,11 +375,11 @@ char *forgeops_build_event_json_with_sql(const forgeops_configuration_t *config,
    * accidentally spill sensitive data. Omitted from the wire entirely (not even an empty object)
    * when user_count is 0, the same "no key at all" shape every other client in this repo's own
    * "user" field gets when absent. */
-  const char *user_id = forgeops_strict_privacy_user_id(user_keys, user_values, user_count);
   if (config->strict_privacy) {
-    if (user_id != NULL) {
+    char hashed_user_id[FORGEOPS_HASHED_USER_ID_SIZE];
+    if (forgeops_strict_privacy_user(config, user_keys, user_values, user_count, hashed_user_id)) {
       forgeops_strbuf_append_str(&out, ",\"user\":{\"id\":");
-      json_append_escaped_string(&out, user_id);
+      json_append_escaped_string(&out, hashed_user_id);
       forgeops_strbuf_append(&out, "}", 1);
     }
   } else if (user_count > 0) {

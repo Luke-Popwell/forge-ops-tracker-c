@@ -21,7 +21,7 @@ include(FetchContent)
 FetchContent_Declare(
   forgeops_tracker
   GIT_REPOSITORY https://github.com/Luke-Popwell/forge-ops-tracker-c.git
-  GIT_TAG v0.13.0
+  GIT_TAG v0.14.0
 )
 FetchContent_MakeAvailable(forgeops_tracker)
 target_link_libraries(your_app PRIVATE forgeops_tracker)
@@ -549,7 +549,10 @@ a name, an email or a diagnosis:
   computed in this process. Errors still group by it, and nothing of the text can be read back.
 - `context` keeps only the keys you list in `privacy_allowed_fields`, and is left out when none
   are there. `tags` is left out.
-- `user` keeps only `id`; never an email or a username.
+- `user` never carries an email, a username or the raw `id`. With `privacy_user_key` set, the id is
+  sent as a keyed hash (HMAC-SHA256 with your key, which never leaves your process), so ForgeOps can
+  still count affected customers but can't read the id. Without a key, no user is sent at all. Keep
+  the key the same across servers and deploys, or one customer counts as two.
 - No breadcrumbs are sent, or recorded.
 - No `sql_statement`, even with `capture_sql_statement` on. `sql_objects` (table and procedure
   names) still goes out.
@@ -577,11 +580,12 @@ forgeops_configuration_t *config = forgeops_tracker_configuration();
 config->strict_privacy = 1;
 const char *allowed[] = {"error_code", "feature"};
 forgeops_configuration_set_privacy_allowed_fields(config, allowed, 2);
+forgeops_configuration_set_privacy_user_key(config, getenv("MY_FORGE_OPS_USER_KEY")); /* default NULL: no user sent */
 ```
 
-Both options are also read from the environment when the configuration is created:
-`FORGE_OPS_STRICT_PRIVACY=true` and `FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature` (comma
-separated). A value set in code wins over the environment.
+All three options are also read from the environment when the configuration is created:
+`FORGE_OPS_STRICT_PRIVACY=true`, `FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature` (comma
+separated) and `FORGE_OPS_PRIVACY_USER_KEY=...`. A value set in code wins over the environment.
 
 ForgeOps applies the same rules again on arrival when the project's own Strict privacy setting is
 on, so an app with an older or misconfigured SDK still can't get text stored for that project.

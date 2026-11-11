@@ -111,8 +111,8 @@ typedef struct {
    * Strict privacy, for apps that can't let personal or health data leave their own servers (see
    * strict_privacy.h). Boolean: 0 = off (the default), 1 = on, seeded from
    * FORGE_OPS_STRICT_PRIVACY=true. With it on an event carries no message (a message_fingerprint
-   * instead), breadcrumbs, SQL statement or source context, only the user's id, and only the
-   * context keys named in privacy_allowed_fields; spans keep an outbound call's method and host,
+   * instead), breadcrumbs, SQL statement or source context, the user's id only as a keyed hash
+   * (privacy_user_key), and only the context keys named in privacy_allowed_fields; spans keep an outbound call's method and host,
    * never its path. Nothing else changes, and with it off nothing changes at all.
    */
   int strict_privacy;
@@ -124,11 +124,19 @@ typedef struct {
    */
   char **privacy_allowed_fields;
   int privacy_allowed_field_count;
+  /*
+   * The secret strict privacy hashes the user's id with (HMAC-SHA256), so the raw id never leaves
+   * the process: a heap string, NULL by default (no user is sent at all), seeded from
+   * FORGE_OPS_PRIVACY_USER_KEY; "" counts as unset. Set it with
+   * forgeops_configuration_set_privacy_user_key, which copies. Keep it the same across deploys and
+   * servers, or the same customer counts as two. Unused with strict privacy off.
+   */
+  char *privacy_user_key;
 } forgeops_configuration_t;
 
 /*
  * Seeds a Configuration from FORGE_OPS_DSN/FORGE_OPS_ENVIRONMENT/FORGE_OPS_RELEASE (and
- * FORGE_OPS_STRICT_PRIVACY/FORGE_OPS_PRIVACY_ALLOWED_FIELDS) and sensible
+ * FORGE_OPS_STRICT_PRIVACY/FORGE_OPS_PRIVACY_ALLOWED_FIELDS/FORGE_OPS_PRIVACY_USER_KEY) and sensible
  * defaults for everything else: the same env vars and defaults every other client in this repo
  * reads. Returns NULL only on allocation failure.
  */
@@ -187,6 +195,9 @@ void forgeops_configuration_set_trace_propagation_targets(forgeops_configuration
  * clears it. The caller keeps ownership of fields and may free it right after this returns.
  */
 void forgeops_configuration_set_privacy_allowed_fields(forgeops_configuration_t *config, const char **fields, size_t count);
+
+/* Replaces config->privacy_user_key, taking a copy of key; NULL or "" clears it. */
+void forgeops_configuration_set_privacy_user_key(forgeops_configuration_t *config, const char *key);
 
 /* 1 if an outgoing call to host should carry a traceparent header (see propagate_traces and
  * trace_propagation_targets), 0 otherwise. A NULL or empty host only matches with no target list. */

@@ -67,9 +67,14 @@ static void sha256_block(uint32_t state[8], const unsigned char block[64]) {
   state[7] += h;
 }
 
-static void sha256(const unsigned char *data, size_t length, unsigned char digest[32]) {
-  uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+static void sha256_init(uint32_t state[8]) {
+  static const uint32_t initial[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  memcpy(state, initial, sizeof(initial));
+}
 
+/* Hashes data on top of whatever whole blocks state has already taken in: total_length is every
+ * byte hashed, those blocks included, for the length the padding ends with. */
+static void sha256_finish(uint32_t state[8], const unsigned char *data, size_t length, uint64_t total_length, unsigned char digest[32]) {
   size_t whole = length - length % 64;
   for (size_t i = 0; i < whole; i += 64) sha256_block(state, data + i);
 
@@ -80,7 +85,7 @@ static void sha256(const unsigned char *data, size_t length, unsigned char diges
   memcpy(tail, data + whole, rest);
   tail[rest] = 0x80;
   size_t tail_length = rest + 9 <= 64 ? 64 : 128;
-  uint64_t bits = (uint64_t)length * 8;
+  uint64_t bits = total_length * 8;
   for (int i = 0; i < 8; i++) tail[tail_length - 1 - i] = (unsigned char)(bits >> (i * 8));
   for (size_t i = 0; i < tail_length; i += 64) sha256_block(state, tail + i);
 
@@ -90,6 +95,38 @@ static void sha256(const unsigned char *data, size_t length, unsigned char diges
     digest[i * 4 + 2] = (unsigned char)(state[i] >> 8);
     digest[i * 4 + 3] = (unsigned char)state[i];
   }
+}
+
+static void sha256(const unsigned char *data, size_t length, unsigned char digest[32]) {
+  uint32_t state[8];
+  sha256_init(state);
+  sha256_finish(state, data, length, length, digest);
+}
+
+/* HMAC-SHA256 (RFC 2104) on the SHA-256 above: SHA256((K' xor opad) || SHA256((K' xor ipad) ||
+ * message)), with K' the key zero-padded to the 64-byte block, or its SHA-256, padded, when it's
+ * longer than that. Each padded key is exactly one block, so it goes in ahead of the rest without
+ * copying the message anywhere. */
+static void hmac_sha256(const unsigned char *key, size_t key_length, const unsigned char *message, size_t message_length, unsigned char digest[32]) {
+  unsigned char padded_key[64] = {0};
+  if (key_length > 64) {
+    sha256(key, key_length, padded_key);
+  } else {
+    memcpy(padded_key, key, key_length);
+  }
+  unsigned char pad[64];
+  uint32_t state[8];
+  unsigned char inner[32];
+
+  for (int i = 0; i < 64; i++) pad[i] = padded_key[i] ^ 0x36;
+  sha256_init(state);
+  sha256_block(state, pad);
+  sha256_finish(state, message, message_length, 64 + (uint64_t)message_length, inner);
+
+  for (int i = 0; i < 64; i++) pad[i] = padded_key[i] ^ 0x5c;
+  sha256_init(state);
+  sha256_block(state, pad);
+  sha256_finish(state, inner, sizeof(inner), 64 + sizeof(inner), digest);
 }
 
 /* message_fingerprint */
@@ -477,6 +514,26 @@ int forgeops_strict_privacy_allows_field(const forgeops_configuration_t *config,
     if (config->privacy_allowed_fields[i] != NULL && strcmp(config->privacy_allowed_fields[i], key) == 0) return 1;
   }
   return 0;
+}
+
+void forgeops_strict_privacy_hashed_user_id(const char *id, const char *key, char out[FORGEOPS_HASHED_USER_ID_SIZE]) {
+  if (id == NULL) id = "";
+  if (key == NULL) key = "";
+  unsigned char digest[32];
+  hmac_sha256((const unsigned char *)key, strlen(key), (const unsigned char *)id, strlen(id), digest);
+  memcpy(out, "h1:", 3);
+  for (int i = 0; i < FORGEOPS_MESSAGE_FINGERPRINT_LENGTH / 2; i++) {
+    snprintf(out + 3 + i * 2, 3, "%02x", digest[i]);
+  }
+}
+
+int forgeops_strict_privacy_user(const forgeops_configuration_t *config, const char **user_keys, const char **user_values, size_t user_count, char out[FORGEOPS_HASHED_USER_ID_SIZE]) {
+  out[0] = '\0';
+  if (config == NULL || config->privacy_user_key == NULL || config->privacy_user_key[0] == '\0') return 0;
+  const char *id = forgeops_strict_privacy_user_id(user_keys, user_values, user_count);
+  if (id == NULL) return 0;
+  forgeops_strict_privacy_hashed_user_id(id, config->privacy_user_key, out);
+  return 1;
 }
 
 const char *forgeops_strict_privacy_user_id(const char **user_keys, const char **user_values, size_t user_count) {
